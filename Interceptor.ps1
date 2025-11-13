@@ -7,7 +7,7 @@ This is only proof-of-concept, and should be used cautiously, to demonstrate the
 This script requires local administrative privileges to execute properly.  
 
 Function: Interceptor
-Author: Casey Smith, Twitter: @subTee
+Author: Casey Smith, Twitter: @_subTee
 License: BSD 3-Clause
 Required Dependencies: None
 Optional Dependencies: None
