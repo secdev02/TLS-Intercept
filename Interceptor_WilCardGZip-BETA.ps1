@@ -1,0 +1,789 @@
+<#
+.SYNOPSIS
+
+This script demonstrates the ability to capture and tamper with Web sessions.  
+For secure sessions, this is done by dynamically writing certificates to match the requested domain. 
+This is only proof-of-concept, and should be used cautiously, to demonstrate the effects of such an attack. 
+This script requires local administrative privileges to execute properly.  
+
+Function: Interceptor
+Author: Casey Smith, Twitter: @_subTee
+License: BSD 3-Clause
+Required Dependencies: None
+Optional Dependencies: None
+Version: 3.9
+Release Date: Updated with Gzip handling
+
+
+.DESCRIPTION
+
+This script sets up an HTTP(s) proxy server on a configurable port.  
+It will write the request headers and response headers to output.  This can be changed.
+Updated to use wildcard certificates for better performance and certificate reuse.
+Now includes proper Gzip decompression, logging, and re-compression.
+
+.PARAMETER ListenPort
+
+Configurable Port to listen for incoming Web requests.  The Default is 8081
+
+.PARAMETER ProxyServer
+
+In many environments it will be necessary to chain HTTP(s) requests upstream to another proxy server.  
+Default behavior expects no upstream proxy.
+
+.PARAMETER ProxyPort
+
+In many environments it will be necessary to chain HTTP(s) requests upstream to another proxy server.  
+This sets the Port for the upstream proxy
+
+.PARAMETER Tamper
+
+Sometimes replaces "Cyber" with "Kitten"
+
+.PARAMETER HostCA
+
+This allows remote devices to connect and install the Interceptor Root Certificate Authority
+From the remote/mobile device browse to http://[InterceptorIP]:8082/i.cer
+example: http://192.168.1.1:8082/i.cer
+
+.PARAMETER AutoProxyConfig
+
+This will alter the system proxy settings to drive traffic through Interceptor.
+
+.PARAMETER Cleanup
+
+Removes any installed certificates and exits.
+
+
+.EXAMPLE
+
+Interceptor.ps1 -ProxyServer localhost -ProxyPort 8888 
+Interceptor.ps1 -Tamper 
+Interceptor.ps1 -HostCA
+
+.NOTES
+This script attempts to make SSL MITM accessible, by being a small compact proof of concept script.  
+It can be used to demonstrate the effects of malicious software. 
+This script requires that you manually change your Browser Proxy Settings to direct traffic to Interceptor. 
+It will install Certificates in your Trusted Root Store.  Use at your own risk :)
+
+.LINK
+
+
+
+#>
+[CmdletBinding()]
+Param(
+  [Parameter(Mandatory=$False,Position=0)]
+  [int]$ListenPort,
+  
+  [Parameter(Mandatory=$False,Position=1)]
+  [string]$ProxyServer,
+  
+  [Parameter(Mandatory=$False,Position=2)]
+  [int]$ProxyPort,
+  
+  [Parameter(Mandatory=$False,Position=3)]
+  [switch]$Tamper,
+  
+  [Parameter(Mandatory=$False,Position=4)]
+  [switch]$HostCA,
+  
+  [Parameter(Mandatory=$False,Position=5)]
+  [switch]$AutoProxyConfig,
+  
+  [Parameter(Mandatory=$False,Position=6)]
+  [switch]$Cleanup
+)
+
+function Set-AutomaticallyDetectProxySettings ($enable) 
+{ 
+    # Read connection settings from Internet Explorer. 
+    $regKeyPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections\" 
+    $conSet = $(Get-ItemProperty $regKeyPath).DefaultConnectionSettings 
+  
+    # Index into DefaultConnectionSettings where the relevant flag resides. 
+    $flagIndex = 8 
+  
+    # Bit inside the relevant flag which indicates whether or not to enable automatically detect proxy settings. 
+    $autoProxyFlag = 8 
+  
+    if ($enable) 
+    { 
+         if ($($conSet[$flagIndex] -band $autoProxyFlag) -eq $autoProxyFlag) 
+        { 
+        } 
+        else 
+        { 
+            Write-Host "Enabling 'Automatically detect proxy settings'." 
+             $conSet[$flagIndex] = $conSet[$flagIndex] -bor $autoProxyFlag 
+            $conSet[4]++ 
+            Set-ItemProperty -Path $regKeyPath -Name DefaultConnectionSettings -Value $conSet 
+         } 
+    } 
+    else 
+    { 
+        if ($($conSet[$flagIndex] -band $autoProxyFlag) -eq $autoProxyFlag) 
+        { 
+            # 'Automatically detect proxy settings' was enabled, adding one disables it. 
+            Write-Host "Disabling 'Automatically detect proxy settings'." 
+            $mask = -bnot $autoProxyFlag 
+             $conSet[$flagIndex] = $conSet[$flagIndex] -band $mask 
+            $conSet[4]++ 
+            Set-ItemProperty -Path $regKeyPath -Name DefaultConnectionSettings -Value $conSet 
+        } 
+    }
+
+     $conSet = $(Get-ItemProperty $regKeyPath).DefaultConnectionSettings 
+        if ($($conSet[$flagIndex] -band $autoProxyFlag) -ne $autoProxyFlag) 
+        { 
+            Write-Host "'Automatically detect proxy settings' is disabled." 
+        } 
+         else 
+        { 
+            Write-Host "'Automatically detect proxy settings' is enabled." 
+        } 
+}
+
+function Get-BaseDomain([string] $hostname)
+{
+    # Extract base domain from hostname
+    # For example: www.example.com -> example.com
+    # sub.domain.example.com -> example.com
+    
+    $parts = $hostname.Split('.')
+    $partCount = $parts.Length
+    
+    # Handle special cases
+    if ($partCount -le 2)
+    {
+        return $hostname
+    }
+    
+    # Return the last two parts (domain.tld)
+    $baseDomain = $parts[$partCount - 2] + "." + $parts[$partCount - 1]
+    return $baseDomain
+}
+
+function Write-InterceptLog([string] $uri, [string] $content, [string] $type)
+{
+    # Create logs directory if it doesn't exist
+    $logDir = Join-Path $env:TEMP "Interceptor_Logs"
+    if(-not (Test-Path $logDir))
+    {
+        New-Item -ItemType Directory -Path $logDir | Out-Null
+    }
+    
+    $timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss-fff"
+    $safeUri = $uri -replace '[\\/:*?"<>|]', '_'
+    $maxLength = [Math]::Min(50, $safeUri.Length)
+    $logFile = Join-Path $logDir ($timestamp + "_" + $type + "_" + $safeUri.Substring(0, $maxLength) + ".txt")
+    
+    $logContent = "=== Intercepted " + $type + " ===" + "`r`n"
+    $logContent += "URI: " + $uri + "`r`n"
+    $logContent += "Timestamp: " + (Get-Date).ToString() + "`r`n"
+    $logContent += "=== Content ===" + "`r`n"
+    $logContent += $content
+    
+    [System.IO.File]::WriteAllText($logFile, $logContent)
+}
+
+function Decompress-GzipContent([byte[]] $gzipBytes)
+{
+    $inputStream = New-Object System.IO.MemoryStream(,$gzipBytes)
+    $gzipStream = New-Object System.IO.Compression.GzipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+    $outputStream = New-Object System.IO.MemoryStream
+    
+    $buffer = New-Object Byte[] 4096
+    while($true)
+    {
+        $read = $gzipStream.Read($buffer, 0, $buffer.Length)
+        if($read -le 0) { break }
+        $outputStream.Write($buffer, 0, $read)
+    }
+    
+    $decompressed = $outputStream.ToArray()
+    $gzipStream.Close()
+    $outputStream.Close()
+    $inputStream.Close()
+    
+    return $decompressed
+}
+
+function Compress-GzipContent([byte[]] $bytes)
+{
+    $outputStream = New-Object System.IO.MemoryStream
+    $gzipStream = New-Object System.IO.Compression.GzipStream($outputStream, [System.IO.Compression.CompressionMode]::Compress)
+    
+    $gzipStream.Write($bytes, 0, $bytes.Length)
+    $gzipStream.Close()
+    
+    $compressed = $outputStream.ToArray()
+    $outputStream.Close()
+    
+    return $compressed
+}
+
+function Start-CertificateAuthority()
+{
+	#Thanks to @obscuresec for this Web Host
+	#Pulls CA Certificate from Store and Writes Directly back to Mobile Device
+	# example: http://localhost:8082/i.cer
+	Start-Job -ScriptBlock {
+			
+			$Hso = New-Object Net.HttpListener
+			$Hso.Prefixes.Add("http://+:8082/")
+			$Hso.Start()
+			While ($Hso.IsListening) {
+				$HC = $Hso.GetContext()
+				$HRes = $HC.Response
+				$HRes.Headers.Add("Content-Type","text/plain")
+				$cert = Get-ChildItem cert:\LocalMachine\Root | where { $_.Issuer -match "__Interceptor_Trusted_Root" }
+				$type = [System.Security.Cryptography.X509Certificates.X509ContentType]::cert
+				$Buf = $cert.Export($type)
+				$HRes.OutputStream.Write($Buf,0,$Buf.Length)
+				$HRes.Close()
+			}
+				
+			}
+	
+	
+	
+}
+
+function Invoke-RemoveCertificates([string] $issuedBy)
+{
+	$certs = Get-ChildItem cert:\LocalMachine\My | where { $_.Issuer -match $issuedBy }
+	if($certs)
+	{
+		foreach ($cert in $certs) 
+		{
+			$store = Get-Item $cert.PSParentPath
+			$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::MaxAllowed)
+			$store.Remove($cert)
+			$store.Close()
+		}
+	}
+	#Remove Any Trusted Root Certificates
+	$certs = Get-ChildItem cert:\LocalMachine\Root | where { $_.Issuer -match $issuedBy }
+	if($certs)
+	{
+	foreach ($cert in $certs) 
+		{
+			$store = Get-Item $cert.PSParentPath
+			$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::MaxAllowed)
+			$store.Remove($cert)
+			$store.Close()
+		}
+	}
+	[Console]::WriteLine("Certificates Removed")
+		
+}
+
+function Invoke-CreateCertificate([string] $certSubject, [bool] $isCA, [bool] $isWildcard)
+{
+    $issuer = "__Interceptor_Trusted_Root"
+    $subject = "CN=" + $certSubject
+    $notBefore = (Get-Date).AddDays(-1)
+    $notAfter = $notBefore.AddDays(90)
+    
+    # Certificate parameters for ECDSA
+    $certParams = @{
+        Subject = $subject
+        NotBefore = $notBefore
+        NotAfter = $notAfter
+        CertStoreLocation = "Cert:\LocalMachine\My"
+        HashAlgorithm = "SHA256"
+        KeyAlgorithm = "ECDsa_nistP256"
+        KeyExportPolicy = "Exportable"
+        TextExtension = @("2.5.29.37={text}1.3.6.1.5.5.7.3.1") # Server Authentication EKU
+    }
+    
+    if ($isCA)
+    {
+        # Create self-signed CA certificate
+        $certParams['KeyUsage'] = @("CertSign", "DigitalSignature")
+        $certParams['TextExtension'] += "2.5.29.19={text}CA=TRUE&pathlength=1" # Basic Constraints
+        
+        $certificate = New-SelfSignedCertificate @certParams
+        
+        # Install CA certificate to Root store
+        $store = New-Object System.Security.Cryptography.X509Certificates.X509Store "Root", "LocalMachine"
+        $store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $store.Add($certificate)
+        $store.Close()
+        
+        return $certificate
+    }
+    else
+    {
+        # Get the CA certificate to sign with
+        $signer = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -match $issuer } | Select-Object -First 1
+        
+        if ($null -eq $signer)
+        {
+            throw "CA certificate not found. Create CA certificate first."
+        }
+        
+        # Add DnsName for Subject Alternative Name (required by modern browsers)
+        if ($isWildcard)
+        {
+            # Extract base domain from wildcard (*.example.com -> example.com)
+            $baseDomain = $certSubject.TrimStart('*').TrimStart('.')
+            # Add both wildcard and base domain to SAN
+            $certParams['DnsName'] = @($certSubject, $baseDomain)
+        }
+        else
+        {
+            $certParams['DnsName'] = @($certSubject)
+        }
+        
+        $certParams['Signer'] = $signer
+        $certParams['KeyUsage'] = @("DigitalSignature", "KeyEncipherment")
+        
+        $certificate = New-SelfSignedCertificate @certParams
+        
+        return $certificate
+    }
+}
+
+
+function Receive-ServerHttpResponse ([System.Net.WebResponse] $response)
+{
+	#Returns a Byte[] from HTTPWebRequest, also for HttpWebRequest Exception Handling
+	Try
+	{
+		[string]$rawProtocolVersion = "HTTP/" + $response.ProtocolVersion
+		[int]$rawStatusCode = [int]$response.StatusCode
+		[string]$rawStatusDescription = [string]$response.StatusDescription
+		$rawHeadersString = New-Object System.Text.StringBuilder 
+		$rawHeaderCollection = $response.Headers
+		$rawHeaders = $response.Headers.AllKeys
+		[bool] $transferEncoding = $false 
+		[bool] $isGzipped = $false
+		# This is used for Chunked Processing.
+		
+		foreach($s in $rawHeaders)
+		{
+			 #We'll handle setting cookies later
+			if($s -eq "Set-Cookie") { Continue }
+			if($s -eq "Transfer-Encoding") 
+			{
+				$transferEncoding = $true
+				continue
+			}
+			if($s -eq "Content-Encoding" -and $rawHeaderCollection.Get($s) -match "gzip")
+			{
+				$isGzipped = $true
+				# Don't add Content-Encoding header yet - we'll handle it after processing
+				continue
+			}
+			[void]$rawHeadersString.AppendLine($s + ": " + $rawHeaderCollection.Get($s) ) #Use [void] or you will get extra string stuff.
+		}	
+		$setCookieString = $rawHeaderCollection.Get("Set-Cookie") -Split '($|,(?! ))' #Split on "," but not ", "
+		if($setCookieString)
+		{
+			foreach ($respCookie in $setCookieString)
+			{
+				if($respCookie -eq "," -Or $respCookie -eq "") {continue}
+				[void]$rawHeadersString.AppendLine("Set-Cookie: " + $respCookie) 
+			}
+		}
+		
+		$responseStream = $response.GetResponseStream()
+		
+		[void][byte[]] $outdata 
+		$tempMemStream = New-Object System.IO.MemoryStream
+		[byte[]] $respbuffer = New-Object Byte[] 32768 # 32768
+		
+		if($transferEncoding)
+		{
+			$reader = New-Object System.IO.StreamReader($responseStream)
+			[string] $responseFromServer = $reader.ReadToEnd()
+			
+			if ($Tamper)
+			{
+				if($responseFromServer -match 'Cyber')
+				{
+					$responseFromServer = $responseFromServer -replace 'Cyber', 'Kitten'
+				}
+			}
+			
+			# Log the content
+			Write-InterceptLog $response.ResponseUri.ToString() $responseFromServer "Response"
+			
+			$outdata = [System.Text.Encoding]::UTF8.GetBytes($responseFromServer)
+			$reader.Close()
+		}
+		else
+		{
+			# Read the response stream
+			while($true)
+			{
+				[int] $read = $responseStream.Read($respbuffer, 0, $respbuffer.Length)
+				if($read -le 0)
+				{
+					$outdata = $tempMemStream.ToArray()
+					break
+				}
+				$tempMemStream.Write($respbuffer, 0, $read)
+			}
+		
+			# Handle Gzip decompression
+			if($isGzipped)
+			{
+				Write-Host "Decompressing Gzip content..." -ForegroundColor Yellow
+				$outdata = Decompress-GzipContent $outdata
+			}
+			
+			# Process content for tampering and logging
+			if ($response.ContentType -match "text/html" -or $response.ContentType -match "application/json" -or $response.ContentType -match "text/plain")
+			{
+				$outdataString = [System.Text.Encoding]::UTF8.GetString($outdata)
+				
+				# Log the decompressed content
+				Write-InterceptLog $response.ResponseUri.ToString() $outdataString "Response"
+				
+				if ($Tamper -and $outdataString -match 'Cyber')
+				{
+					Write-Host "Tampering detected - replacing Cyber with Kitten" -ForegroundColor Magenta
+					$outdataString = $outdataString -Replace 'Cyber', 'Kitten' 
+					$outdata = [System.Text.Encoding]::UTF8.GetBytes($outdataString)
+				}
+			}
+			
+			# Re-compress if it was originally Gzipped
+			if($isGzipped)
+			{
+				Write-Host "Re-compressing Gzip content..." -ForegroundColor Yellow
+				$outdata = Compress-GzipContent $outdata
+				# Now add the Content-Encoding header back
+				[void]$rawHeadersString.AppendLine("Content-Encoding: gzip")
+			}
+		}
+		
+		# Update Content-Length header
+		$rawHeadersString = $rawHeadersString.ToString() -replace 'Content-Length: \d+', ("Content-Length: " + $outdata.Length)
+		
+		$rstring = $rawProtocolVersion + " " + $rawStatusCode + " " + $rawStatusDescription + "`r`n" + $rawHeadersString.ToString() + "`r`n"
+		
+		[byte[]] $rawHeaderBytes = [System.Text.Encoding]::Ascii.GetBytes($rstring)
+		# DebugTrace
+		#Write-Host $rstring 
+		
+		[byte[]] $rv = New-Object Byte[] ($rawHeaderBytes.Length + $outdata.Length)
+		#Combine Header Bytes and Entity Bytes 
+		
+		[System.Buffer]::BlockCopy( $rawHeaderBytes, 0, $rv, 0, $rawHeaderBytes.Length)
+		[System.Buffer]::BlockCopy( $outdata, 0, $rv, $rawHeaderBytes.Length, $outdata.Length ) 
+	
+		
+		$tempMemStream.Close()
+		$response.Close()
+		
+		return $rv
+	}
+	Catch [System.Exception]
+	{
+		[Console]::WriteLine("Get Response Error")
+		[Console]::WriteLine($_.Exception.Message)
+    }#End Catch
+	
+}
+
+function Send-ServerHttpRequest([string] $URI, [string] $httpMethod,[byte[]] $requestBytes, [System.Net.WebProxy] $proxy )
+{	
+	#Prepare and Send an HttpWebRequest From Byte[] Returns Byte[]
+	Try
+	{
+		$requestParse = [System.Text.Encoding]::UTF8.GetString($requestBytes)
+		[string[]] $requestString = ($requestParse -split '[\r\n]') |? {$_} 
+		
+		[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+		[System.Net.HttpWebRequest] $request = [System.Net.HttpWebRequest] [System.Net.WebRequest]::Create($URI)	
+		
+		$request.KeepAlive = $false
+		$request.ProtocolVersion = [System.Net.Httpversion]::version11 
+		$request.ServicePoint.ConnectionLimit = 1
+		if($proxy -eq $null) { $request.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy() }
+		else { $request.Proxy = $proxy }
+		$request.Method = $httpMethod
+		$request.AllowAutoRedirect = $false 
+		$request.AutomaticDecompression = [System.Net.DecompressionMethods]::None
+	
+		For ($i = 1; $i -le $requestString.Length; $i++)
+		{
+			$line = $requestString[$i] -split ": " 
+			if ( $line[0] -eq "Host" -Or $line[0] -eq $null ) { continue }
+			Try
+			{
+				#Add Header Properties Defined By Class
+				switch($line[0])
+				{
+					"Accept" { $request.Accept = $line[1] }
+					"Connection" { "" }
+					"Content-Length" { $request.ContentLength = $line[1] }
+					"Content-Type" { $request.ContentType = $line[1] }
+					"Expect" { $request.Expect = $line[1] }
+					"Date" { $request.Date = $line[1] }
+					"If-Modified-Since" { $request.IfModifiedSince = $line[1] }
+					"Range" { $request.Range = $line[1] }
+					"Referer" { $request.Referer = $line[1] }
+					"User-Agent" { $request.UserAgent = $line[1]  + " Intercepted Traffic"} 
+					# Added Tampering Here...User-Agent Example
+					"Transfer-Encoding"  { $request.TransferEncoding = $line[1] } 
+					default {
+								# Allow Accept-Encoding to pass through - we'll handle Gzip properly
+								$request.Headers.Add($line[0], $line[1])
+							}
+				}
+				
+			}
+			Catch
+			{
+				
+			}
+		}
+			
+		if (($httpMethod -eq "POST") -And ($request.ContentLength -gt 0)) 
+		{
+			[System.IO.Stream] $outputStream = [System.IO.Stream]$request.GetRequestStream()
+			$outputStream.Write($requestBytes, $requestBytes.Length - $request.ContentLength, $request.ContentLength)
+			$outputStream.Close()
+		}
+		
+		
+		return Receive-ServerHttpResponse $request.GetResponse()
+		
+	}
+	Catch [System.Net.WebException]
+	{
+		#HTTPWebRequest  Throws exceptions based on Server Response.  So catch and return server response
+		if ($_.Exception.Response) 
+		{
+			return Receive-ServerHttpResponse $_.Exception.Response
+        }
+			
+    }#End Catch Web Exception
+	Catch [System.Exception]
+	{	
+		Write-Verbose $_.Exception.Message
+	}#End General Exception Occured...
+	
+}#Proxied Get
+
+function Receive-ClientHttpRequest([System.Net.Sockets.TcpClient] $client, [System.Net.WebProxy] $proxy)
+{
+	
+	Try
+	{	
+		$clientStream = $client.GetStream()
+		$byteArray = new-object System.Byte[] 32768 
+		[void][byte[]] $byteClientRequest
+
+		do 
+		 {
+			[int] $NumBytesRead = $clientStream.Read($byteArray, 0, $byteArray.Length) 
+			$byteClientRequest += $byteArray[0..($NumBytesRead - 1)]  
+		 
+		 } While ($clientStream.DataAvailable -And $NumBytesRead -gt 0) 
+			
+		#Now you have a byte[] Get a string...  Caution, not all that is sent is "string" Headers will be.
+		$requestString = [System.Text.Encoding]::UTF8.GetString($byteClientRequest)
+		
+		[string[]] $requestArray = ($requestString -split '[\r\n]') |? {$_} 
+		[string[]] $methodParse = $requestArray[0] -split " "
+		#Begin SSL MITM IF Request Contains CONNECT METHOD
+		
+		if($methodParse[0] -ceq "CONNECT")
+		{
+			[string[]] $domainParse = $methodParse[1].Split(":")
+			$requestedHostname = $domainParse[0]
+			
+			# Get base domain for wildcard certificate
+			$baseDomain = Get-BaseDomain $requestedHostname
+			$wildcardSubject = "*." + $baseDomain
+			
+			$connectSpoof = [System.Text.Encoding]::Ascii.GetBytes("HTTP/1.1 200 Connection Established`r`nTimeStamp: " + [System.DateTime]::Now.ToString() + "`r`n`r`n")
+			$clientStream.Write($connectSpoof, 0, $connectSpoof.Length)	
+			$clientStream.Flush()
+			$sslStream = New-Object System.Net.Security.SslStream($clientStream , $false)
+			$sslStream.ReadTimeout = 500
+			$sslStream.WriteTimeout = 500
+			
+			# First, try to find existing wildcard certificate for the base domain
+			$sslcertfake = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+				$_.Subject -eq ("CN=" + $wildcardSubject)
+			} | Select-Object -First 1
+			
+			# If no wildcard cert exists, create one
+			if ($sslcertfake -eq $null)
+			{
+				Write-Host ("Creating wildcard certificate for: " + $wildcardSubject) -ForegroundColor Green
+				$sslcertfake = Invoke-CreateCertificate $wildcardSubject $false $true
+			}
+			else
+			{
+				Write-Host ("Using existing wildcard certificate for: " + $wildcardSubject) -ForegroundColor Cyan
+			}
+			
+			$protocols = [System.Security.Authentication.SslProtocols]::Tls13 -bor [System.Security.Authentication.SslProtocols]::Tls12
+			$sslStream.AuthenticateAsServer($sslcertfake, $false, $protocols, $false)
+		
+			$sslbyteArray = new-object System.Byte[] 32768
+			[void][byte[]] $sslbyteClientRequest
+			
+			do 
+			 {
+				[int] $NumBytesRead = $sslStream.Read($sslbyteArray, 0, $sslbyteArray.Length) 
+				$sslbyteClientRequest += $sslbyteArray[0..($NumBytesRead - 1)]  
+			 } while ( $clientStream.DataAvailable  )
+			
+			$SSLRequest = [System.Text.Encoding]::UTF8.GetString($sslbyteClientRequest)
+            # Debug
+			# Write-Host $SSLRequest -Fore Yellow
+			
+			[string[]] $SSLrequestArray = ($SSLRequest -split '[\r\n]') |? {$_} 
+			[string[]] $SSLmethodParse = $SSLrequestArray[0] -split " "
+			
+			$secureURI = "https://" + $requestedHostname + $SSLmethodParse[1]
+			
+			[byte[]] $byteResponse =  Send-ServerHttpRequest $secureURI $SSLmethodParse[0] $sslbyteClientRequest $proxy
+			
+			if($byteResponse[0] -eq '0x00')
+			{
+				$sslStream.Write($byteResponse, 1, $byteResponse.Length - 1)
+			}
+			else
+			{
+				$sslStream.Write($byteResponse, 0, $byteResponse.Length )
+			}
+			
+			
+			
+		}#End CONNECT/SSL Processing
+		Else
+		{
+			#Write-Host $requestString -Fore Cyan
+			[byte[]] $proxiedResponse = Send-ServerHttpRequest $methodParse[1] $methodParse[0] $byteClientRequest $proxy
+			if($proxiedResponse[0] -eq '0x00')
+			{
+				$clientStream.Write($proxiedResponse, 1, $proxiedResponse.Length - 1 )	
+			}
+			else
+			{
+				$clientStream.Write($proxiedResponse, 0, $proxiedResponse.Length )	
+			}
+			
+		}#End Http Proxy
+		
+		
+	}# End HTTPProcessing Block
+	Catch
+	{
+		#Write-Verbose $_.Exception.Message
+		$client.Close()
+	}
+	Finally
+	{
+		$client.Close()
+	}
+                
+}
+
+function Main()
+{	
+	if($Cleanup)
+	{
+		Invoke-RemoveCertificates( "__Interceptor_Trusted_Root" )
+		exit
+	}
+	
+	# Create And Install Trusted Root CA.
+	$CAcertificate = (Get-ChildItem Cert:\LocalMachine\My | Where-Object {$_.Subject -match "__Interceptor_Trusted_Root"  })
+	if ($CACertificate -eq $null)
+	{
+		Invoke-CreateCertificate "__Interceptor_Trusted_Root" $true $false
+	}
+	# Create Some Certificates Early to Speed up Capture. If you wanted to...
+	# You could Add Auto Proxy Configuration here too.
+	
+	if($HostCA)
+	{
+		netsh advfirewall firewall delete rule name="Interceptor Proxy 8082" | Out-Null #First Run May Throw Error...Thats Ok..:)
+		netsh advfirewall firewall add rule name="Interceptor Proxy 8082" dir=in action=allow protocol=TCP localport=8082 | Out-Null
+		Start-CertificateAuthority
+		
+	}
+	
+	if($ListenPort)
+	{
+		$port = $ListenPort
+	}
+	else
+	{
+		$port = 8081
+	}
+	
+	$endpoint = New-Object System.Net.IPEndPoint ([system.net.ipaddress]::any, $port)
+	$listener = New-Object System.Net.Sockets.TcpListener $endpoint
+	
+	#This sets up a local firewall rule to suppress the Windows "Allow Listening Port Prompt"
+	netsh advfirewall firewall delete rule name="Interceptor Proxy $port" | Out-Null #First Run May Throw Error...Thats Ok..:)
+	netsh advfirewall firewall add rule name="Interceptor Proxy $port" dir=in action=allow protocol=TCP localport=$port | Out-Null
+	
+	if($AutoProxyConfig)
+	{
+		#TODO - Map Existing Proxy Settings, for transparent upstream chaining
+		# 
+		$proxyServerToDefine = "localhost:" + $port
+
+		$regKey="HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" 
+		
+		Set-AutomaticallyDetectProxySettings ($false) 
+			
+		Set-ItemProperty -path $regKey ProxyEnable -value 1 
+		Set-ItemProperty -path $regKey ProxyServer -value $proxyServerToDefine 
+		Write-Host "Proxy is now enabled" 
+		 
+	}
+	
+	
+	
+	
+	if($ProxyServer)
+	{
+		$proxy = New-Object System.Net.WebProxy($ProxyServer, $ProxyPort)
+		[Console]::WriteLine("Using Proxy Server " + $ProxyServer + " : " + $ProxyPort)
+	}
+	else
+	{
+		$proxy = $null
+		# If you are going Direct.  You need this to be null, or HTTPWebrequest loops...
+		[Console]::WriteLine("Using Direct Internet Connection")
+	}
+		
+	
+	$listener.Start()
+	[Console]::WriteLine("Listening on " + $port)
+	[Console]::WriteLine("Logs will be saved to: " + (Join-Path $env:TEMP "Interceptor_Logs"))
+	$client = New-Object System.Net.Sockets.TcpClient
+	$client.NoDelay = $true
+	
+	
+	
+	while($true)
+	{
+		
+		$client = $listener.AcceptTcpClient()
+		if($client -ne $null)
+		{
+			Receive-ClientHttpRequest $client $proxy
+		}
+		
+	}
+	
+
+}
+
+Main
