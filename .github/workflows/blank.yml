@@ -25,5 +25,5 @@ jobs:
           .\Interceptor_Logging.ps1
           }
           Start-Sleep -Seconds 10
-          curl -vv -x "http:/127.0.0.1:8081" "https://example.com"
-  
+          curl -k -vv -x "http:/127.0.0.1:8081" "https://example.com"
+          Receive-Job -Id $job.Id -Keep
