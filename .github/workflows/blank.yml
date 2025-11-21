@@ -1,0 +1,25 @@
+name: PowerShell Workflow on Windows
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  run-powershell-script:
+    runs-on: windows-latest # Specifies a Windows runner
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4 # Action to check out your code
+
+      - name: Execute PowerShell Script
+        shell: pwsh # Uses PowerShell Core
+        run: |
+          Write-Host "Hello from PowerShell on GitHub Actions!"
+          $currentTime = Get-Date
+          Write-Output "Current time: $currentTime"
+          
+          # Example of running a command and displaying its output
+          Get-Service | Select-Object Name, Status | Format-Table -AutoSize
+          
