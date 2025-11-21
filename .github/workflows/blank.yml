@@ -14,7 +14,9 @@ jobs:
       
       - name: Run Script 1
         shell: pwsh
-        run: .\Interceptor_Logging.ps1
+        run: |
+        ipconfig
+        .\Interceptor_Logging.ps1
   
   script2:
     runs-on: windows-latest
