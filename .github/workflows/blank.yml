@@ -23,4 +23,6 @@ jobs:
           # Example of running a command and displaying its output
           Get-Process | Select-Object Name, Status | Format-Table -AutoSize
           ipconfig 
-          Interceptor_Logging.ps1
+          ls
+          
+          .\Interceptor_Logging.ps1
