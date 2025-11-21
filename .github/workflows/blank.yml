@@ -24,26 +24,6 @@ jobs:
           
           .\Interceptor_Logging.ps1
           }
-          curl -vv -x "http:/127.0.0.1:8081" "https://example.com"
-          
-  
-  script2:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Execute PowerShell Script
-        shell: pwsh # Uses PowerShell Core
-        run: |
-          Write-Host "Hello from PowerShell on GitHub Actions!"
-          $currentTime = Get-Date
-          Write-Output "Current time: $currentTime"
-          
-          # Example of running a command and displaying its output
-          Get-Process | Select-Object Name, Status | Format-Table -AutoSize
-          ipconfig 
-          ls
           Start-Sleep -Seconds 10
-          
-          
+          curl -vv -x "http:/127.0.0.1:8081" "https://example.com"
+  
