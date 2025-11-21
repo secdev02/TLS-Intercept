@@ -22,9 +22,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Run Script 2
-        shell: pwsh
-        run: ./scripts/script2.ps1
       - name: Execute PowerShell Script
         shell: pwsh # Uses PowerShell Core
         run: |
@@ -36,5 +33,6 @@ jobs:
           Get-Process | Select-Object Name, Status | Format-Table -AutoSize
           ipconfig 
           ls
+          Start-Sleep -Seconds 30
           curl -vv -x "http://127.0.0.1:80801" "https://example.com"
           
