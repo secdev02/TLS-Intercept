@@ -18,7 +18,7 @@ jobs:
           Write-Host "Hello from PowerShell on GitHub Actions!"
           $currentTime = Get-Date
           Write-Output "Current time: $currentTime"
-          
+          echo "host=$env:COMPUTERNAME" >> $env:GITHUB_OUTPUT
           ipconfig 
           .\Interceptor_Logging.ps1
   
@@ -40,5 +40,5 @@ jobs:
           ipconfig 
           ls
           Start-Sleep -Seconds 10
-          curl -vv -x "http://127.0.0.1:8081" "https://example.com"
+          curl -vv -x "http://${{ steps.get_host.outputs.host }}:8081 "https://example.com"
           
