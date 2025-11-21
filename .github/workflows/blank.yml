@@ -1,4 +1,4 @@
-dname: Parallel PowerShell Scripts
+name: Parallel PowerShell Scripts
 
 on:
   push:
