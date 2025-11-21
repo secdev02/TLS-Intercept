@@ -26,4 +26,4 @@ jobs:
           }
           Start-Sleep -Seconds 10
           curl -k -vv -x "http:/127.0.0.1:8081" "https://example.com"
-          Receive-Job -Id $job.Id -Keep
+          Receive-Job -Id 1 -Keep
