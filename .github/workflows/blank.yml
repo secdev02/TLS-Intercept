@@ -34,5 +34,5 @@ jobs:
           ipconfig 
           ls
           Start-Sleep -Seconds 10
-          curl -vv -x "http://127.0.0.1" "https://example.com"
+          curl -vv -x "http://127.0.0.1:8081" "https://example.com"
           
