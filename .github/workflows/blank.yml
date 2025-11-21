@@ -1,18 +1,30 @@
-name: PowerShell Workflow on Windows
+name: Parallel PowerShell Scripts
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  run-powershell-script:
-    runs-on: windows-latest # Specifies a Windows runner
-
+  script1:
+    runs-on: windows-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4 # Action to check out your code
-
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Script 1
+        shell: pwsh
+        run: .\Interceptor_Logging.ps1
+  
+  script2:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Script 2
+        shell: pwsh
+        run: ./scripts/script2.ps1
       - name: Execute PowerShell Script
         shell: pwsh # Uses PowerShell Core
         run: |
@@ -24,5 +36,5 @@ jobs:
           Get-Process | Select-Object Name, Status | Format-Table -AutoSize
           ipconfig 
           ls
+          curl -vv -x "http://127.0.0.1:80801" "https://example.com"
           
-          .\Interceptor_Logging.ps1
