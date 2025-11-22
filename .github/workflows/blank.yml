@@ -22,7 +22,7 @@ jobs:
           ipconfig 
           Start-Job -ScriptBlock {
           
-          .\Interceptor.ps1
+          .\Interceptor_Logging.ps1
           }
           Start-Sleep -Seconds 20
           cmd.exe /k curl --no-alpn -k -vv -x "http:/127.0.0.1:8081" "https://example.com"
