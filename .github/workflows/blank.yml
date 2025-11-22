@@ -17,7 +17,11 @@ jobs:
         run: |
           Write-Host "Hello from PowerShell on GitHub Actions!"
           $currentTime = Get-Date
-          Write-Output "Current time: $currentTime"
+          Write-Output "curl no Proxy"
+
+          cmd.exe /k curl --no-alpn -k -vv "https://example.com"
+
+          
           echo "host=$env:COMPUTERNAME" >> $env:GITHUB_OUTPUT
           ipconfig 
           Start-Job -ScriptBlock {
