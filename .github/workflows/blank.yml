@@ -25,6 +25,6 @@ jobs:
           .\Interceptor.ps1
           }
           Start-Sleep -Seconds 10
-          curl -k -vv -x "http:/127.0.0.1:8081" "https://google.com"
+          cmd.exe /k curl -k -vv -x "http:/127.0.0.1:8081" "https://example..com"
           Receive-Job -Id 1 
           Receive-Job -Id 1 -Keep
