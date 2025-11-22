@@ -626,12 +626,27 @@ function Receive-ClientHttpRequest([System.Net.Sockets.TcpClient] $client, [Syst
 
             [byte[]] $byteResponse = Send-ServerHttpRequest $secureURI $SSLmethodParse[0] $sslbyteClientRequest $proxy $currentRequestId
 
-            if ($byteResponse[0] -eq '0x00') {
-                $sslStream.Write($byteResponse, 1, $byteResponse.Length - 1)
-            } else {
-                $sslStream.Write($byteResponse, 0, $byteResponse.Length)
-            }
-            $sslStream.Flush()
+			if (-not $byteResponse -or $byteResponse.Length -eq 0) {
+			    Write-InterceptorLog ("Upstream returned null/empty response for " + $secureURI) "Red"
+			
+			    # Fallback: send a minimal 502 to the client so TLS closes cleanly
+			    $errBody = "Bad Gateway: upstream request failed."
+			    $errStr  = "HTTP/1.1 502 Bad Gateway`r`n" +
+			               "Content-Type: text/plain`r`n" +
+			               ("Content-Length: {0}`r`n" -f $errBody.Length) +
+			               "Connection: close`r`n`r`n" +
+			               $errBody
+			
+			    $byteResponse = [System.Text.Encoding]::ASCII.GetBytes($errStr)
+			}
+			
+			# Now it's safe to index [0], but also guard by length
+			if ($byteResponse.Length -gt 0 -and $byteResponse[0] -eq '0x00') {
+			    $sslStream.Write($byteResponse, 1, $byteResponse.Length - 1)
+			} else {
+			    $sslStream.Write($byteResponse, 0, $byteResponse.Length)
+			}
+			$sslStream.Flush()
         }
         else {
             # Plain HTTP proxy path
