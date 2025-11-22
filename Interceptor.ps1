@@ -376,7 +376,7 @@ function Send-ServerHttpRequest([string] $URI, [string] $httpMethod,[byte[]] $re
 		[System.Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
 		[System.Net.HttpWebRequest] $request = [System.Net.HttpWebRequest] [System.Net.WebRequest]::Create($URI)	
 		
-		$request.KeepAlive = $false
+		$request.KeepAlive = $true
 		$request.ProtocolVersion = [System.Net.Httpversion]::version11 
 		$request.ServicePoint.ConnectionLimit = 1
 		if($proxy -eq $null) { $request.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy() }
