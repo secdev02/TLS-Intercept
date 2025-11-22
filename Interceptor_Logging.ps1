@@ -496,191 +496,173 @@ function Send-ServerHttpRequest([string] $URI, [string] $httpMethod,[byte[]] $re
 
 function Receive-ClientHttpRequest([System.Net.Sockets.TcpClient] $client, [System.Net.WebProxy] $proxy)
 {
-	
-	Try
-	{	
-		$clientStream = $client.GetStream()
-		$byteArray = new-object System.Byte[] 32768 
-		[void][byte[]] $byteClientRequest
-		
-		# Increment request counter
-		$script:RequestCounter++
-		$currentRequestId = $script:RequestCounter
+    $clientStream = $null
+    $sslStream    = $null
 
-		do 
-		 {
-			[int] $NumBytesRead = $clientStream.Read($byteArray, 0, $byteArray.Length) 
-			$byteClientRequest += $byteArray[0..($NumBytesRead - 1)]  
-		 
-		 } While ($clientStream.DataAvailable -And $NumBytesRead -gt 0) 
-			
-		#Now you have a byte[] Get a string...  Caution, not all that is sent is "string" Headers will be.
-		$requestString = [System.Text.Encoding]::UTF8.GetString($byteClientRequest)
-		
-		[string[]] $requestArray = ($requestString -split '[\r\n]') |? {$_} 
-		[string[]] $methodParse = $requestArray[0] -split " "
-		
-		# Log HTTP Request
-		Write-InterceptorLog ("===== REQUEST [#" + $currentRequestId + "] =====") "Green"
-		Write-InterceptorLog ("Client: " + $client.Client.RemoteEndPoint.ToString()) "Green"
-		Write-InterceptorLog ("Method: " + $methodParse[0] + " URL: " + $methodParse[1]) "Green"
-		
-		# Log all headers
-		for($i = 1; $i -lt $requestArray.Length; $i++)
-		{
-			if($requestArray[$i].Length -gt 0)
-			{
-				Write-InterceptorLog ("Request Header: " + $requestArray[$i]) "Green"
-			}
-		}
-		
-		# Extract POST/PUT data if present
-		if($methodParse[0] -eq "POST" -or $methodParse[0] -eq "PUT" -or $methodParse[0] -eq "PATCH")
-		{
-			$bodyStartIndex = $requestString.IndexOf("`r`n`r`n")
-			if($bodyStartIndex -gt -1)
-			{
-				$postData = $requestString.Substring($bodyStartIndex + 4)
-				if($postData.Length -gt 0)
-				{
-					Write-InterceptorLog ("Request Body (" + $methodParse[0] + " Data):") "Magenta"
-					Write-InterceptorLog $postData "Magenta"
-				}
-			}
-		}
-		
-		Write-InterceptorLog ("===== END REQUEST [#" + $currentRequestId + "] =====") "Green"
-		
-		#Begin SSL MITM IF Request Contains CONNECT METHOD
-		
-		if($methodParse[0] -ceq "CONNECT")
-		{
-			[string[]] $domainParse = $methodParse[1].Split(":")
-			$requestedHostname = $domainParse[0]
-			
-			Write-InterceptorLog ("CONNECT to: " + $requestedHostname) "Yellow"
-			
-			# Get base domain for wildcard certificate
-			$baseDomain = Get-BaseDomain $requestedHostname
-			$wildcardSubject = "*." + $baseDomain
-			
-			$connectSpoof = [System.Text.Encoding]::Ascii.GetBytes("HTTP/1.1 200 Connection Established`r`nTimeStamp: " + [System.DateTime]::Now.ToString() + "`r`n`r`n")
-			$clientStream.Write($connectSpoof, 0, $connectSpoof.Length)	
-			$clientStream.Flush()
-			$sslStream = New-Object System.Net.Security.SslStream($clientStream , $false)
-			$sslStream.ReadTimeout = 500
-			$sslStream.WriteTimeout = 500
-			
-			# First, try to find existing wildcard certificate for the base domain
-			$sslcertfake = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
-				$_.Subject -eq ("CN=" + $wildcardSubject)
-			} | Select-Object -First 1
-			
-			# If no wildcard cert exists, create one
-			if ($sslcertfake -eq $null)
-			{
-				Write-Host ("Creating wildcard certificate for: " + $wildcardSubject) -ForegroundColor Green
-				Write-InterceptorLog ("Creating wildcard certificate for: " + $wildcardSubject) "Green"
-				$sslcertfake = Invoke-CreateCertificate $wildcardSubject $false $true
-			}
-			else
-			{
-				Write-Host ("Using existing wildcard certificate for: " + $wildcardSubject) -ForegroundColor Cyan
-				Write-InterceptorLog ("Using existing wildcard certificate for: " + $wildcardSubject) "Cyan"
-			}
-			
-			$protocols = [System.Security.Authentication.SslProtocols]::Tls13 -bor [System.Security.Authentication.SslProtocols]::Tls12
-			$sslStream.AuthenticateAsServer($sslcertfake, $false, $protocols, $false)
-		
-			$sslbyteArray = new-object System.Byte[] 32768
-			[void][byte[]] $sslbyteClientRequest
-			
-			do 
-			 {
-				[int] $NumBytesRead = $sslStream.Read($sslbyteArray, 0, $sslbyteArray.Length) 
-				$sslbyteClientRequest += $sslbyteArray[0..($NumBytesRead - 1)]  
-			 } while ( $clientStream.DataAvailable  )
-			
-			$SSLRequest = [System.Text.Encoding]::UTF8.GetString($sslbyteClientRequest)
-            
-			[string[]] $SSLrequestArray = ($SSLRequest -split '[\r\n]') |? {$_} 
-			[string[]] $SSLmethodParse = $SSLrequestArray[0] -split " "
-			
-			$secureURI = "https://" + $requestedHostname + $SSLmethodParse[1]
-			
-			# Log HTTPS Request
-			Write-InterceptorLog ("===== HTTPS REQUEST [#" + $currentRequestId + "] =====") "Green"
-			Write-InterceptorLog ("Secure Method: " + $SSLmethodParse[0] + " Secure URL: " + $secureURI) "Green"
-			
-			# Log all HTTPS headers
-			for($i = 1; $i -lt $SSLrequestArray.Length; $i++)
-			{
-				if($SSLrequestArray[$i].Length -gt 0)
-				{
-					Write-InterceptorLog ("HTTPS Header: " + $SSLrequestArray[$i]) "Green"
-				}
-			}
-			
-			# Extract and log HTTPS POST data
-			if($SSLmethodParse[0] -eq "POST" -or $SSLmethodParse[0] -eq "PUT" -or $SSLmethodParse[0] -eq "PATCH")
-			{
-				$bodyStartIndex = $SSLRequest.IndexOf("`r`n`r`n")
-				if($bodyStartIndex -gt -1)
-				{
-					$postData = $SSLRequest.Substring($bodyStartIndex + 4)
-					if($postData.Length -gt 0)
-					{
-						Write-InterceptorLog ("HTTPS Body (" + $SSLmethodParse[0] + " Data):") "Magenta"
-						Write-InterceptorLog $postData "Magenta"
-					}
-				}
-			}
-			
-			Write-InterceptorLog ("===== END HTTPS REQUEST [#" + $currentRequestId + "] =====") "Green"
-			
-			[byte[]] $byteResponse =  Send-ServerHttpRequest $secureURI $SSLmethodParse[0] $sslbyteClientRequest $proxy $currentRequestId
-			
-			if($byteResponse[0] -eq '0x00')
-			{
-				$sslStream.Write($byteResponse, 1, $byteResponse.Length - 1)
-			}
-			else
-			{
-				$sslStream.Write($byteResponse, 0, $byteResponse.Length )
-			}
-			
-			
-			
-		}#End CONNECT/SSL Processing
-		Else
-		{
-			#Write-Host $requestString -Fore Cyan
-			[byte[]] $proxiedResponse = Send-ServerHttpRequest $methodParse[1] $methodParse[0] $byteClientRequest $proxy $currentRequestId
-			if($proxiedResponse[0] -eq '0x00')
-			{
-				$clientStream.Write($proxiedResponse, 1, $proxiedResponse.Length - 1 )	
-			}
-			else
-			{
-				$clientStream.Write($proxiedResponse, 0, $proxiedResponse.Length )	
-			}
-			
-		}#End Http Proxy
-		
-		
-	}# End HTTPProcessing Block
-	Catch
-	{
-		Write-Verbose $_.Exception.Message
-		Write-InterceptorLog ("Client Request Error: " + $_.Exception.Message) "Red"
-		$client.Close()
-	}
-	Finally
-	{
-		$client.Close()
-	}
-                
+    try {
+        $clientStream = $client.GetStream()
+        $byteArray = New-Object System.Byte[] 32768
+        [byte[]] $byteClientRequest = @()
+
+        # Increment request counter
+        $script:RequestCounter++
+        $currentRequestId = $script:RequestCounter
+
+        do {
+            [int] $NumBytesRead = $clientStream.Read($byteArray, 0, $byteArray.Length)
+            if ($NumBytesRead -le 0) { break }
+            $byteClientRequest += $byteArray[0..($NumBytesRead - 1)]
+        } while ($clientStream.DataAvailable -and $NumBytesRead -gt 0)
+
+        $requestString = [System.Text.Encoding]::UTF8.GetString($byteClientRequest)
+        [string[]] $requestArray = ($requestString -split '[\r\n]') | ? { $_ }
+        [string[]] $methodParse = $requestArray[0] -split " "
+
+        # Log HTTP Request
+        Write-InterceptorLog ("===== REQUEST [#" + $currentRequestId + "] =====") "Green"
+        Write-InterceptorLog ("Client: " + $client.Client.RemoteEndPoint.ToString()) "Green"
+        Write-InterceptorLog ("Method: " + $methodParse[0] + " URL: " + $methodParse[1]) "Green"
+
+        for ($i = 1; $i -lt $requestArray.Length; $i++) {
+            if ($requestArray[$i].Length -gt 0) {
+                Write-InterceptorLog ("Request Header: " + $requestArray[$i]) "Green"
+            }
+        }
+
+        # Extract POST/PUT/PATCH data
+        if ($methodParse[0] -in @("POST","PUT","PATCH")) {
+            $bodyStartIndex = $requestString.IndexOf("`r`n`r`n")
+            if ($bodyStartIndex -gt -1) {
+                $postData = $requestString.Substring($bodyStartIndex + 4)
+                if ($postData.Length -gt 0) {
+                    Write-InterceptorLog ("Request Body (" + $methodParse[0] + " Data):") "Magenta"
+                    Write-InterceptorLog $postData "Magenta"
+                }
+            }
+        }
+
+        Write-InterceptorLog ("===== END REQUEST [#" + $currentRequestId + "] =====") "Green"
+
+        # CONNECT / HTTPS MITM
+        if ($methodParse[0] -ceq "CONNECT") {
+            [string[]] $domainParse     = $methodParse[1].Split(":")
+            $requestedHostname          = $domainParse[0]
+            Write-InterceptorLog ("CONNECT to: " + $requestedHostname) "Yellow"
+
+            $baseDomain     = Get-BaseDomain $requestedHostname
+            $wildcardSubject = "*." + $baseDomain
+
+            $connectSpoof = [System.Text.Encoding]::Ascii.GetBytes(
+                "HTTP/1.1 200 Connection Established`r`nTimeStamp: " +
+                [System.DateTime]::Now.ToString() + "`r`n`r`n"
+            )
+            $clientStream.Write($connectSpoof, 0, $connectSpoof.Length)
+            $clientStream.Flush()
+
+            $sslStream = New-Object System.Net.Security.SslStream($clientStream, $false)
+            # Increase timeouts so CI latency doesn't kill it
+            $sslStream.ReadTimeout  = 30000
+            $sslStream.WriteTimeout = 30000
+
+            $sslcertfake = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+                $_.Subject -eq ("CN=" + $wildcardSubject)
+            } | Select-Object -First 1
+
+            if (-not $sslcertfake) {
+                Write-Host ("Creating wildcard certificate for: " + $wildcardSubject) -ForegroundColor Green
+                Write-InterceptorLog ("Creating wildcard certificate for: " + $wildcardSubject) "Green"
+                $sslcertfake = Invoke-CreateCertificate $wildcardSubject $false $true
+            } else {
+                Write-Host ("Using existing wildcard certificate for: " + $wildcardSubject) -ForegroundColor Cyan
+                Write-InterceptorLog ("Using existing wildcard certificate for: " + $wildcardSubject) "Cyan"
+            }
+
+            if (-not $sslcertfake.HasPrivateKey) {
+                throw "Certificate for " + $wildcardSubject + " has no private key. Cannot authenticate as server."
+            }
+
+            $protocols = [System.Security.Authentication.SslProtocols]::Tls13 -bor
+                         [System.Security.Authentication.SslProtocols]::Tls12
+
+            $sslStream.AuthenticateAsServer($sslcertfake, $false, $protocols, $false)
+
+            $sslbyteArray = New-Object System.Byte[] 32768
+            [byte[]] $sslbyteClientRequest = @()
+
+            do {
+                [int] $NumBytesRead = $sslStream.Read($sslbyteArray, 0, $sslbyteArray.Length)
+                if ($NumBytesRead -le 0) { break }
+                $sslbyteClientRequest += $sslbyteArray[0..($NumBytesRead - 1)]
+            } while ($sslStream.DataAvailable)
+
+            $SSLRequest = [System.Text.Encoding]::UTF8.GetString($sslbyteClientRequest)
+            [string[]] $SSLrequestArray = ($SSLRequest -split '[\r\n]') | ? { $_ }
+            [string[]] $SSLmethodParse  = $SSLrequestArray[0] -split " "
+
+            $secureURI = "https://" + $requestedHostname + $SSLmethodParse[1]
+
+            Write-InterceptorLog ("===== HTTPS REQUEST [#" + $currentRequestId + "] =====") "Green"
+            Write-InterceptorLog ("Secure Method: " + $SSLmethodParse[0] +
+                                  " Secure URL: " + $secureURI) "Green"
+
+            for ($i = 1; $i -lt $SSLrequestArray.Length; $i++) {
+                if ($SSLrequestArray[$i].Length -gt 0) {
+                    Write-InterceptorLog ("HTTPS Header: " + $SSLrequestArray[$i]) "Green"
+                }
+            }
+
+            if ($SSLmethodParse[0] -in @("POST","PUT","PATCH")) {
+                $bodyStartIndex = $SSLRequest.IndexOf("`r`n`r`n")
+                if ($bodyStartIndex -gt -1) {
+                    $postData = $SSLRequest.Substring($bodyStartIndex + 4)
+                    if ($postData.Length -gt 0) {
+                        Write-InterceptorLog ("HTTPS Body (" + $SSLmethodParse[0] + " Data):") "Magenta"
+                        Write-InterceptorLog $postData "Magenta"
+                    }
+                }
+            }
+
+            Write-InterceptorLog ("===== END HTTPS REQUEST [#" + $currentRequestId + "] =====") "Green"
+
+            [byte[]] $byteResponse = Send-ServerHttpRequest $secureURI $SSLmethodParse[0] $sslbyteClientRequest $proxy $currentRequestId
+
+            if ($byteResponse[0] -eq '0x00') {
+                $sslStream.Write($byteResponse, 1, $byteResponse.Length - 1)
+            } else {
+                $sslStream.Write($byteResponse, 0, $byteResponse.Length)
+            }
+            $sslStream.Flush()
+        }
+        else {
+            # Plain HTTP proxy path
+            [byte[]] $proxiedResponse = Send-ServerHttpRequest $methodParse[1] $methodParse[0] $byteClientRequest $proxy $currentRequestId
+
+            if ($proxiedResponse[0] -eq '0x00') {
+                $clientStream.Write($proxiedResponse, 1, $proxiedResponse.Length - 1)
+            } else {
+                $clientStream.Write($proxiedResponse, 0, $proxiedResponse.Length)
+            }
+            $clientStream.Flush()
+        }
+
+    } catch {
+        Write-Verbose $_.Exception.Message
+        Write-InterceptorLog ("Client Request Error: " + $_.Exception.Message) "Red"
+        # No explicit Close() here; let Finally handle cleanup so TLS shutdown can be attempted.
+    } finally {
+        if ($sslStream -ne $null) {
+            try { $sslStream.Flush() } catch {}
+            try { $sslStream.Dispose() } catch {}
+        }
+        if ($clientStream -ne $null) {
+            try { $clientStream.Dispose() } catch {}
+        }
+        if ($client -ne $null) {
+            try { $client.Close() } catch {}
+        }
+    }
 }
+
 
 function Main()
 {	
