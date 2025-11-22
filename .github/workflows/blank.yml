@@ -20,7 +20,7 @@ jobs:
           Write-Output "curl no Proxy"
 
           cmd.exe /k curl --no-alpn -k -vv "https://example.com"
-
+          Start-Sleep -Seconds 20
           
           echo "host=$env:COMPUTERNAME" >> $env:GITHUB_OUTPUT
           ipconfig 
