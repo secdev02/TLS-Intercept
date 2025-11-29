@@ -15,6 +15,7 @@ param(
     [switch]$ParseOnly,
     [string]$ParseFile,
     [string]$Thumbprint,
+    [string]$SubjectPattern,
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$StoreLocation = "CurrentUser",
     [string]$StoreName = "My",
@@ -122,6 +123,7 @@ function Get-OIDString {
 function Get-CertificateFromStore {
     param(
         [string]$Thumbprint,
+        [string]$SubjectPattern,
         [string]$StoreLocation,
         [string]$StoreName
     )
@@ -129,12 +131,46 @@ function Get-CertificateFromStore {
     $storePath = "Cert:\" + $StoreLocation + "\" + $StoreName
     
     if ($Thumbprint) {
-        $cert = Get-ChildItem -Path $storePath | Where-Object { $_.Thumbprint -eq $Thumbprint }
+        # Ensure thumbprint is uppercase for comparison
+        $Thumbprint = $Thumbprint.ToUpper()
+        $cert = Get-ChildItem -Path $storePath | Where-Object { $_.Thumbprint.ToUpper() -eq $Thumbprint }
         if (-not $cert) {
-            Write-Error ("Certificate with thumbprint " + $Thumbprint + " not found in " + $storePath)
+            Write-Host ("ERROR: CERTIFICATE WITH THUMBPRINT " + $Thumbprint + " NOT FOUND IN " + $storePath) -ForegroundColor Red
             return $null
         }
         return $cert
+    }
+    
+    if ($SubjectPattern) {
+        # Search by subject name pattern (supports wildcards)
+        $certs = Get-ChildItem -Path $storePath | Where-Object { $_.Subject -like $SubjectPattern }
+        
+        if (-not $certs -or $certs.Count -eq 0) {
+            Write-Host ("ERROR: NO CERTIFICATES FOUND MATCHING SUBJECT PATTERN: " + $SubjectPattern) -ForegroundColor Red
+            return $null
+        }
+        
+        if ($certs.Count -eq 1) {
+            return $certs
+        }
+        
+        # Multiple matches found - display them and let user choose
+        Write-Host ""
+        Write-Host ("MULTIPLE CERTIFICATES FOUND MATCHING PATTERN: " + $SubjectPattern) -ForegroundColor Yellow
+        Write-Host ""
+        
+        for ($i = 0; $i -lt $certs.Count; $i++) {
+            $cert = $certs[$i]
+            Write-Host ("[" + ($i + 1) + "] SUBJECT: " + $cert.Subject) -ForegroundColor White
+            Write-Host ("    THUMBPRINT: " + $cert.Thumbprint) -ForegroundColor Gray
+            Write-Host ("    VALID: " + $cert.NotBefore + " TO " + $cert.NotAfter) -ForegroundColor Gray
+            Write-Host ("    ALGORITHM: " + $cert.PublicKey.Oid.FriendlyName) -ForegroundColor Gray
+            Write-Host ""
+        }
+        
+        Write-Host ("USING FIRST MATCH: " + $certs[0].Subject) -ForegroundColor Cyan
+        Write-Host ""
+        return $certs[0]
     }
     
     return $null
@@ -148,14 +184,14 @@ function Show-CertificateList {
     
     $storePath = "Cert:\" + $StoreLocation + "\" + $StoreName
     
-    Write-Host ("=== Certificates in " + $storePath + " ===") -ForegroundColor Cyan
+    Write-Host ("=== CERTIFICATES IN " + $storePath + " ===") -ForegroundColor Cyan
     Write-Host ""
     
     try {
         $certs = Get-ChildItem -Path $storePath -ErrorAction Stop
         
         if ($certs.Count -eq 0) {
-            Write-Host "No certificates found in this store." -ForegroundColor Yellow
+            Write-Host "NO CERTIFICATES FOUND IN THIS STORE." -ForegroundColor Yellow
             return
         }
         
@@ -163,19 +199,19 @@ function Show-CertificateList {
             $keyAlg = $cert.PublicKey.Oid.FriendlyName
             $isECC = $keyAlg -like "*ECC*" -or $keyAlg -like "*ECDSA*"
             
-            Write-Host ("Subject: " + $cert.Subject) -ForegroundColor White
-            Write-Host ("  Thumbprint: " + $cert.Thumbprint) -ForegroundColor Gray
-            Write-Host ("  Valid From: " + $cert.NotBefore) -ForegroundColor Gray
-            Write-Host ("  Valid To:   " + $cert.NotAfter) -ForegroundColor Gray
-            Write-Host ("  Algorithm:  " + $keyAlg) -ForegroundColor $(if ($isECC) { "Green" } else { "Gray" })
-            Write-Host ("  Issuer:     " + $cert.Issuer) -ForegroundColor Gray
+            Write-Host ("SUBJECT: " + $cert.Subject) -ForegroundColor White
+            Write-Host ("  THUMBPRINT: " + $cert.Thumbprint) -ForegroundColor Gray
+            Write-Host ("  VALID FROM: " + $cert.NotBefore) -ForegroundColor Gray
+            Write-Host ("  VALID TO:   " + $cert.NotAfter) -ForegroundColor Gray
+            Write-Host ("  ALGORITHM:  " + $keyAlg) -ForegroundColor $(if ($isECC) { "Green" } else { "Gray" })
+            Write-Host ("  ISSUER:     " + $cert.Issuer) -ForegroundColor Gray
             Write-Host ""
         }
         
-        Write-Host ("Total: " + $certs.Count + " certificate(s)") -ForegroundColor Cyan
+        Write-Host ("TOTAL: " + $certs.Count + " CERTIFICATE(S)") -ForegroundColor Cyan
     }
     catch {
-        Write-Error ("Failed to access store: " + $_.Exception.Message)
+        Write-Host ("ERROR: FAILED TO ACCESS STORE: " + $_.Exception.Message) -ForegroundColor Red
     }
 }
 
@@ -195,7 +231,7 @@ function Set-ByteAtOffset {
     )
     
     if ($Offset -lt 0 -or $Offset -ge $Bytes.Length) {
-        Write-Error ("Offset " + $Offset + " is out of range (0-" + ($Bytes.Length - 1) + ")")
+        Write-Host ("ERROR: OFFSET " + $Offset + " IS OUT OF RANGE (0-" + ($Bytes.Length - 1) + ")") -ForegroundColor Red
         return $Bytes
     }
     
@@ -208,7 +244,7 @@ function Set-ByteAtOffset {
         $newByte = [byte]$Value
     }
     else {
-        Write-Error ("Invalid byte value: " + $Value + ". Use decimal (0-255) or hex (0x00-0xFF)")
+        Write-Host ("ERROR: INVALID BYTE VALUE: " + $Value + ". USE DECIMAL (0-255) OR HEX (0X00-0XFF)") -ForegroundColor Red
         return $Bytes
     }
     
@@ -216,12 +252,12 @@ function Set-ByteAtOffset {
     $Bytes[$Offset] = $newByte
     
     Write-Host ""
-    Write-Host "=== Byte Modification ===" -ForegroundColor Yellow
-    Write-Host ("Offset:        " + $Offset)
-    Write-Host ("Original byte: 0x" + $originalByte.ToString("X2") + " (" + $originalByte + ")")
-    Write-Host ("New byte:      0x" + $newByte.ToString("X2") + " (" + $newByte + ")")
+    Write-Host "=== BYTE MODIFICATION ===" -ForegroundColor Yellow
+    Write-Host ("OFFSET:        " + $Offset)
+    Write-Host ("ORIGINAL BYTE: 0x" + $originalByte.ToString("X2") + " (" + $originalByte + ")")
+    Write-Host ("NEW BYTE:      0x" + $newByte.ToString("X2") + " (" + $newByte + ")")
     Write-Host ""
-    Write-Host "WARNING: Modified certificate data - signature will be invalid!" -ForegroundColor Red
+    Write-Host "WARNING: MODIFIED CERTIFICATE DATA - SIGNATURE WILL BE INVALID!" -ForegroundColor Red
     Write-Host ""
     
     return $Bytes
@@ -285,8 +321,8 @@ function Parse-ASN1 {
             $tagName = "TAG[" + $tag.ToString("X2") + "]"
         }
         
-        $offsetStr = "Offset: " + $tagStart.ToString().PadLeft(6)
-        $lengthStr = "Length: " + $length.ToString().PadLeft(6)
+        $offsetStr = "OFFSET: " + $tagStart.ToString().PadLeft(6)
+        $lengthStr = "LENGTH: " + $length.ToString().PadLeft(6)
         $headerStr = $indent_str + $offsetStr + " | " + $lengthStr + " | " + $tagName
         
         # Determine if this is a constructed type
@@ -309,22 +345,22 @@ function Parse-ASN1 {
             Write-Host $headerStr -NoNewline
             Write-Host $valueStr -ForegroundColor Cyan
             $hexDump = Format-HexDump -Bytes $Bytes -Offset $contentStart -Length $length
-            Write-Host ($indent_str + "  Data: " + $hexDump) -ForegroundColor DarkGray
+            Write-Host ($indent_str + "  DATA: " + $hexDump) -ForegroundColor DarkGray
         }
         elseif ($tag -eq 0x02) {  # INTEGER
             Write-Host $headerStr -ForegroundColor Yellow
             $hexDump = Format-HexDump -Bytes $Bytes -Offset $contentStart -Length $length
-            Write-Host ($indent_str + "  Data: " + $hexDump) -ForegroundColor DarkGray
+            Write-Host ($indent_str + "  DATA: " + $hexDump) -ForegroundColor DarkGray
         }
         elseif ($tag -eq 0x03) {  # BIT STRING
             Write-Host $headerStr -ForegroundColor Magenta
             $hexDump = Format-HexDump -Bytes $Bytes -Offset $contentStart -Length $length
-            Write-Host ($indent_str + "  Data: " + $hexDump) -ForegroundColor DarkGray
+            Write-Host ($indent_str + "  DATA: " + $hexDump) -ForegroundColor DarkGray
         }
         elseif ($tag -eq 0x04) {  # OCTET STRING
             Write-Host $headerStr -ForegroundColor Blue
             $hexDump = Format-HexDump -Bytes $Bytes -Offset $contentStart -Length $length
-            Write-Host ($indent_str + "  Data: " + $hexDump) -ForegroundColor DarkGray
+            Write-Host ($indent_str + "  DATA: " + $hexDump) -ForegroundColor DarkGray
         }
         elseif ($tag -eq 0x13 -or $tag -eq 0x0C -or $tag -eq 0x16) {  # PrintableString, UTF8String, IA5String
             if ($length -gt 0 -and ($contentStart + $length) -le $Bytes.Length) {
@@ -354,7 +390,7 @@ function Parse-ASN1 {
             Write-Host $headerStr
             if ($length -gt 0 -and $length -le 64 -and ($contentStart + $length) -le $Bytes.Length) {
                 $hexDump = Format-HexDump -Bytes $Bytes -Offset $contentStart -Length $length
-                Write-Host ($indent_str + "  Data: " + $hexDump) -ForegroundColor DarkGray
+                Write-Host ($indent_str + "  DATA: " + $hexDump) -ForegroundColor DarkGray
             }
         }
         
@@ -373,10 +409,10 @@ function New-ECCCertificate {
         [int]$ValidDays
     )
     
-    Write-Host "`n=== Generating ECC Certificate for TLS 1.3 ===" -ForegroundColor Green
-    Write-Host ("Subject: " + $SubjectName)
-    Write-Host ("Curve: NIST P-256 (secp256r1)")
-    Write-Host ("Signature Algorithm: ECDSA with SHA-256")
+    Write-Host "`n=== GENERATING ECC CERTIFICATE FOR TLS 1.3 ===" -ForegroundColor Green
+    Write-Host ("SUBJECT: " + $SubjectName)
+    Write-Host ("CURVE: NIST P-256 (SECP256R1)")
+    Write-Host ("SIGNATURE ALGORITHM: ECDSA WITH SHA-256")
     Write-Host ""
     
     # Create the certificate request
@@ -394,10 +430,10 @@ function New-ECCCertificate {
     
     $cert = New-SelfSignedCertificate @params
     
-    Write-Host "Certificate created successfully!" -ForegroundColor Green
-    Write-Host ("Thumbprint: " + $cert.Thumbprint)
-    Write-Host ("Valid From: " + $cert.NotBefore)
-    Write-Host ("Valid To: " + $cert.NotAfter)
+    Write-Host "CERTIFICATE CREATED SUCCESSFULLY!" -ForegroundColor Green
+    Write-Host ("THUMBPRINT: " + $cert.Thumbprint)
+    Write-Host ("VALID FROM: " + $cert.NotBefore)
+    Write-Host ("VALID TO: " + $cert.NotAfter)
     Write-Host ""
     
     # Export to PFX
@@ -405,13 +441,13 @@ function New-ECCCertificate {
     $pfxPath = Join-Path (Get-Location) $OutputPath
     Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePassword | Out-Null
     
-    Write-Host ("Certificate exported to: " + $pfxPath) -ForegroundColor Green
+    Write-Host ("CERTIFICATE EXPORTED TO: " + $pfxPath) -ForegroundColor Green
     
     # Also export the public certificate for parsing
     $cerPath = $pfxPath -replace '\.pfx$', '.cer'
     Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
     
-    Write-Host ("Public certificate exported to: " + $cerPath) -ForegroundColor Green
+    Write-Host ("PUBLIC CERTIFICATE EXPORTED TO: " + $cerPath) -ForegroundColor Green
     
     # Clean up from cert store
     Remove-Item -Path ("Cert:\CurrentUser\My\" + $cert.Thumbprint) -Force
@@ -420,7 +456,7 @@ function New-ECCCertificate {
 }
 
 # Main execution
-Write-Host "=== ECC Certificate Generator and ASN.1 Parser ===" -ForegroundColor Cyan
+Write-Host "=== ECC CERTIFICATE GENERATOR AND ASN.1 PARSER ===" -ForegroundColor Cyan
 Write-Host ""
 
 # Handle list certificates mode
@@ -436,46 +472,62 @@ $sourceDescription = ""
 if ($ParseOnly -and $ParseFile) {
     # Parse existing file
     if (-not (Test-Path $ParseFile)) {
-        Write-Error ("File not found: " + $ParseFile)
+        Write-Host ("ERROR: FILE NOT FOUND: " + $ParseFile) -ForegroundColor Red
         exit 1
     }
     
-    $sourceDescription = "File: " + $ParseFile
+    $sourceDescription = "FILE: " + $ParseFile
     $certBytes = [System.IO.File]::ReadAllBytes($ParseFile)
 }
-elseif ($Thumbprint) {
+elseif ($Thumbprint -or $SubjectPattern) {
     # Read from certificate store
-    Write-Host ("Reading certificate from store: Cert:\" + $StoreLocation + "\" + $StoreName) -ForegroundColor Yellow
-    Write-Host ("Thumbprint: " + $Thumbprint) -ForegroundColor Yellow
-    Write-Host ""
+    if ($Thumbprint) {
+        $Thumbprint = $Thumbprint.ToUpper()
+        Write-Host ("READING CERTIFICATE FROM STORE: CERT:\" + $StoreLocation + "\" + $StoreName) -ForegroundColor Yellow
+        Write-Host ("THUMBPRINT: " + $Thumbprint) -ForegroundColor Yellow
+        Write-Host ""
+        
+        $cert = Get-CertificateFromStore -Thumbprint $Thumbprint -StoreLocation $StoreLocation -StoreName $StoreName
+    }
+    else {
+        Write-Host ("READING CERTIFICATE FROM STORE: CERT:\" + $StoreLocation + "\" + $StoreName) -ForegroundColor Yellow
+        Write-Host ("SUBJECT PATTERN: " + $SubjectPattern) -ForegroundColor Yellow
+        Write-Host ""
+        
+        $cert = Get-CertificateFromStore -SubjectPattern $SubjectPattern -StoreLocation $StoreLocation -StoreName $StoreName
+    }
     
-    $cert = Get-CertificateFromStore -Thumbprint $Thumbprint -StoreLocation $StoreLocation -StoreName $StoreName
     if (-not $cert) {
         Write-Host ""
-        Write-Host "Tip: Use -ListCertificates to see available certificates" -ForegroundColor Cyan
+        Write-Host "TIP: USE -LISTCERTIFICATES TO SEE AVAILABLE CERTIFICATES" -ForegroundColor Cyan
         exit 1
     }
     
-    Write-Host ("Found certificate: " + $cert.Subject) -ForegroundColor Green
-    Write-Host ("  Algorithm: " + $cert.PublicKey.Oid.FriendlyName) -ForegroundColor Green
-    Write-Host ("  Valid: " + $cert.NotBefore + " to " + $cert.NotAfter) -ForegroundColor Green
+    Write-Host ("FOUND CERTIFICATE: " + $cert.Subject) -ForegroundColor Green
+    Write-Host ("  ALGORITHM: " + $cert.PublicKey.Oid.FriendlyName) -ForegroundColor Green
+    Write-Host ("  VALID: " + $cert.NotBefore + " TO " + $cert.NotAfter) -ForegroundColor Green
     Write-Host ""
     
-    $sourceDescription = "Store: Cert:\" + $StoreLocation + "\" + $StoreName + " (" + $Thumbprint + ")"
+    if ($Thumbprint) {
+        $sourceDescription = "STORE: CERT:\" + $StoreLocation + "\" + $StoreName + " (THUMBPRINT: " + $Thumbprint + ")"
+    }
+    else {
+        $sourceDescription = "STORE: CERT:\" + $StoreLocation + "\" + $StoreName + " (SUBJECT: " + $cert.Subject + ")"
+    }
     $certBytes = Export-CertificateBytes -Certificate $cert
 }
 else {
     # Generate new certificate
     $cerPath = New-ECCCertificate -SubjectName $SubjectName -OutputPath $CertPath -Password $Password -ValidDays $ValidDays
     
-    $sourceDescription = "Generated: " + $cerPath
+    $sourceDescription = "GENERATED: " + $cerPath
     $certBytes = [System.IO.File]::ReadAllBytes($cerPath)
 }
 
 # Apply byte modification if requested
 if ($ModifyOffset -ge 0) {
     if (-not $ModifyValue) {
-        Write-Error "ModifyValue parameter is required when ModifyOffset is specified"
+        Write-Host "ERROR: MODIFYVALUE PARAMETER IS REQUIRED WHEN MODIFYOFFSET IS SPECIFIED" -ForegroundColor Red
         exit 1
     }
     
@@ -483,14 +535,14 @@ if ($ModifyOffset -ge 0) {
 }
 
 # Parse the certificate
-Write-Host ("=== Parsing Certificate ===" ) -ForegroundColor Cyan
-Write-Host ("Source: " + $sourceDescription) -ForegroundColor Gray
-Write-Host ("Total size: " + $certBytes.Length + " bytes") -ForegroundColor Gray
+Write-Host ("=== PARSING CERTIFICATE ===" ) -ForegroundColor Cyan
+Write-Host ("SOURCE: " + $sourceDescription) -ForegroundColor Gray
+Write-Host ("TOTAL SIZE: " + $certBytes.Length + " BYTES") -ForegroundColor Gray
 Write-Host ""
-Write-Host "=== ASN.1 Structure ===" -ForegroundColor Cyan
+Write-Host "=== ASN.1 STRUCTURE ===" -ForegroundColor Cyan
 Write-Host ""
 
 Parse-ASN1 -Bytes $certBytes
 
 Write-Host ""
-Write-Host "=== Complete ===" -ForegroundColor Green
+Write-Host "=== COMPLETE ===" -ForegroundColor Green
