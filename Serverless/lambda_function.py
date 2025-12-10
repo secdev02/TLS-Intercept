@@ -7,17 +7,44 @@ import re
 import base64
 from datetime import datetime
 
+def replace_content(html_content):
+    """
+    Replace specific content for testing/prod environments
+    """
+    # Replace 'army' with 'navy' (case-insensitive)
+    html_content = re.sub(r'\barmy\b', 'navy', html_content, flags=re.IGNORECASE)
+    html_content = re.sub(r'\bArmy\b', 'Navy', html_content)
+    html_content = re.sub(r'\bARMY\b', 'NAVY', html_content)
+    
+    return html_content
+
 def rewrite_urls(html_content, original_url, proxy_base_url):
     """
     Rewrite all URLs in HTML to go through the proxy
+    Skip analytics and tracking URLs
     """
     parsed_original = urllib.parse.urlparse(original_url)
     base_url = parsed_original.scheme + '://' + parsed_original.netloc
+    
+    # URLs that should NOT be proxied (analytics, tracking, etc.)
+    skip_patterns = [
+        '/gen_204',  # Google analytics
+        '/pagead/',  # Google ads
+        '/log?',     # Logging endpoints
+        'google-analytics.com',
+        'googletagmanager.com',
+        'doubleclick.net',
+    ]
     
     # Function to convert URL to proxied version
     def to_proxy_url(url):
         if not url or url.startswith('data:') or url.startswith('javascript:') or url.startswith('#'):
             return url
+        
+        # Skip analytics/tracking URLs
+        for pattern in skip_patterns:
+            if pattern in url:
+                return url
         
         # Make absolute
         if url.startswith('//'):
@@ -28,8 +55,13 @@ def rewrite_urls(html_content, original_url, proxy_base_url):
             # Relative URL
             url = urllib.parse.urljoin(original_url, url)
         
+        # Skip if still matches patterns after making absolute
+        for pattern in skip_patterns:
+            if pattern in url:
+                return url
+        
         # Convert to proxy URL - always use /debug path
-        return proxy_base_url + '/debug?site=' + urllib.parse.quote(url, safe='') + '&inline=true'
+        return proxy_base_url + '/debug?url=' + urllib.parse.quote(url, safe='') + '&inline=true'
     
     # Rewrite src attributes (img, script, iframe, etc.) - handle both " and '
     html_content = re.sub(
@@ -110,11 +142,29 @@ def rewrite_urls(html_content, original_url, proxy_base_url):
 def lambda_handler(event, context):
     """
     AWS Lambda handler for TLS debugging reverse proxy
+    Supports GET and POST requests, cookie forwarding, and workflow debugging
     """
     
-    # Parse query parameters
+    # Get HTTP method
+    http_method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')
+    
+    # Handle OPTIONS preflight for CORS
+    if http_method == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': '*',
+                'Access-Control-Max-Age': '86400',
+                'Access-Control-Allow-Credentials': 'true'
+            },
+            'body': ''
+        }
+    
+    # Parse query parameters - handle both 'url' and 'site' parameters for compatibility
     query_params = event.get('queryStringParameters', {})
-    if not query_params or 'site' not in query_params:
+    if not query_params:
         return {
             'statusCode': 400,
             'headers': {
@@ -122,19 +172,33 @@ def lambda_handler(event, context):
                 'Access-Control-Allow-Origin': '*'
             },
             'body': json.dumps({
-                'error': 'Missing required parameter: site',
-                'usage': 'Add ?site=example.com to the URL'
+                'error': 'Missing required parameter: url',
+                'usage': 'Add ?url=https://example.com to the URL'
             })
         }
     
-    target_site = query_params['site']
+    # Accept both 'url' and 'site' parameters for backward compatibility
+    target_site = query_params.get('url') or query_params.get('site')
+    if not target_site:
+        return {
+            'statusCode': 400,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'error': 'Missing required parameter: url or site',
+                'usage': 'Add ?url=https://example.com to the URL'
+            })
+        }
+    
     inline_mode = query_params.get('inline', '').lower() in ['true', '1', 'yes']
     trace_mode = query_params.get('trace', '').lower() in ['true', '1', 'yes']
     
     # Always use api.tlsdebug.com as proxy base URL
     proxy_base_url = 'https://api.tlsdebug.com'
     
-    # Clean up the site URL
+    # Clean up the site URL - add https:// if no scheme provided
     if not target_site.startswith('http'):
         target_site = 'https://' + target_site
     
@@ -147,76 +211,257 @@ def lambda_handler(event, context):
         # Prepare the request
         request_url = target_site if parsed_url.path else target_site + '/'
         
+        # Get POST data if present
+        post_data = None
+        content_type = None
+        if http_method == 'POST':
+            # Get body from event
+            body = event.get('body', '')
+            if event.get('isBase64Encoded', False):
+                post_data = base64.b64decode(body)
+            else:
+                post_data = body.encode('utf-8') if body else None
+            
+            # Get content type from headers
+            headers = event.get('headers', {})
+            content_type = headers.get('content-type') or headers.get('Content-Type')
+        
         # Create request
-        req = urllib.request.Request(request_url)
+        req = urllib.request.Request(request_url, data=post_data, method=http_method)
         req.add_header('User-Agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
         req.add_header('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8')
         req.add_header('Accept-Language', 'en-US,en;q=0.9')
-        # DO NOT request compression - we need uncompressed responses to rewrite URLs
-        # req.add_header('Accept-Encoding', 'gzip, deflate, br')
         req.add_header('Referer', parsed_url.scheme + '://' + parsed_url.netloc + '/')
         
-        # Capture request details
-        request_details = {
-            'method': 'GET',
-            'url': request_url,
-            'hostname': hostname,
-            'port': port,
-            'path': path,
-            'headers': dict(req.headers),
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
-        }
+        # Forward cookies from client to server
+        request_headers = event.get('headers', {})
+        if 'cookie' in request_headers or 'Cookie' in request_headers:
+            cookie_header = request_headers.get('cookie') or request_headers.get('Cookie')
+            req.add_header('Cookie', cookie_header)
         
-        # Log trace if enabled
+        # Add Content-Type for POST
+        if content_type and http_method == 'POST':
+            req.add_header('Content-Type', content_type)
+        
+        # Initialize trace log
         trace_log = []
         if trace_mode:
             trace_log.append({
                 'event': 'request_start',
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'url': request_url,
-                'method': 'GET',
-                'headers': dict(req.headers)
+                'method': http_method
             })
         
-        # Create SSL context to capture certificate info
-        ssl_context = ssl.create_default_context()
+        # Capture request details
+        request_details = {
+            'method': http_method,
+            'url': request_url,
+            'headers': dict(req.headers),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
         
-        # Start timing
-        import time
-        start_time = time.time()
+        if post_data:
+            request_details['body_size'] = len(post_data)
+            request_details['content_type'] = content_type
         
-        # Make the request
-        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as response:
+        # Create custom SSL context with lower security for debugging
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # Don't verify certificates for debugging
+        ctx.set_ciphers('ALL:@SECLEVEL=0')  # Allow all ciphers including weak ones
+        
+        # Make the connection
+        start_time = datetime.utcnow()
+        
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
             # Calculate duration
-            duration_ms = int((time.time() - start_time) * 1000)
+            end_time = datetime.utcnow()
+            duration_ms = (end_time - start_time).total_seconds() * 1000
             
-            # Get certificate information
-            cert = response.fp.raw._sock.getpeercert()
-            cipher = response.fp.raw._sock.cipher()
-            
-            # Log trace if enabled
             if trace_mode:
                 trace_log.append({
                     'event': 'response_received',
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'status': response.status,
-                    'status_text': response.reason,
-                    'headers': dict(response.headers),
                     'duration_ms': duration_ms
                 })
             
-            content_type = response.headers.get('Content-Type', 'text/html')
+            # Get TLS/SSL information
+            sock = response.fp.raw._sock
+            cipher = sock.cipher() if hasattr(sock, 'cipher') else None
+            cert = sock.getpeercert() if hasattr(sock, 'getpeercert') else None
             
-            # Read response body (limit to 100KB for HTML, 1MB for other)
+            # Read response
+            response_data = response.read()
+            content_type = response.headers.get('Content-Type', '')
+            
+            if trace_mode:
+                trace_log.append({
+                    'event': 'response_read',
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'content_type': content_type,
+                    'size': len(response_data)
+                })
+            
+            # Decode if text
+            is_text = any(t in content_type.lower() for t in ['text/', 'application/json', 'application/xml', 'application/javascript', '+xml', '+json'])
+            
+            if is_text:
+                # Try to decode as text
+                try:
+                    body = response_data.decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        body = response_data.decode('latin-1')
+                    except:
+                        # If all else fails, treat as binary
+                        is_text = False
+            
+            # If inline mode is enabled, return the content directly
             if inline_mode:
-                # For inline mode, read more data and handle different content types
-                if 'text/html' in content_type:
-                    body = response.read(102400).decode('utf-8', errors='replace')
-                elif 'text/css' in content_type or 'javascript' in content_type or 'text/' in content_type:
-                    body = response.read(1048576).decode('utf-8', errors='replace')
-                else:
-                    # Binary content (images, fonts, etc.) - return as-is
-                    body = response.read(1048576)
+                # For HTML, rewrite URLs to proxy
+                if 'text/html' in content_type and is_text:
+                    if trace_mode:
+                        trace_log.append({
+                            'event': 'rewriting_urls',
+                            'timestamp': datetime.utcnow().isoformat() + 'Z'
+                        })
+                    
+                    body = rewrite_urls(body, request_url, proxy_base_url)
+                    
+                    # Apply content replacements (army -> navy)
+                    body = replace_content(body)
+                    
+                    # Inject JavaScript for debugging and URL interception
+                    debug_script = """
+<script>
+// TLS Debug - Intercept fetch and XHR requests
+(function() {
+    console.log('=== TLS Debug Inline Mode ===');
+    console.log('Original URL:', '""" + request_url + """');
+    console.log('Original Origin:', new URL('""" + request_url + """').origin);
+    console.log('All resources are being proxied');
+    console.log('Proxy URL:', window.location.href);
+    
+    const PROXY_BASE = '""" + proxy_base_url + """';
+    const ORIGINAL_ORIGIN = new URL('""" + request_url + """').origin;
+    
+    // Skip these patterns - don't proxy analytics
+    const SKIP_PATTERNS = ['/gen_204', '/pagead/', '/log?', 'google-analytics.com', 'googletagmanager.com', 'doubleclick.net'];
+    
+    function shouldSkip(url) {
+        return SKIP_PATTERNS.some(pattern => url.includes(pattern));
+    }
+    
+    function proxyUrl(url) {
+        if (!url || url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:') || shouldSkip(url)) {
+            return url;
+        }
+        
+        // Make absolute
+        if (url.startsWith('//')) {
+            url = window.location.protocol + url;
+        } else if (url.startsWith('/')) {
+            url = ORIGINAL_ORIGIN + url;
+        } else if (!url.startsWith('http')) {
+            url = new URL(url, '""" + request_url + """').href;
+        }
+        
+        // Check again after making absolute
+        if (shouldSkip(url)) {
+            return url;
+        }
+        
+        return PROXY_BASE + '/debug?url=' + encodeURIComponent(url) + '&inline=true';
+    }
+    
+    // Intercept fetch
+    const originalFetch = window.fetch;
+    window.fetch = function(url, options = {}) {
+        const proxiedUrl = proxyUrl(url);
+        console.log('Fetch intercepted:', url, '->', proxiedUrl);
+        return originalFetch(proxiedUrl, options);
+    };
+    
+    // Intercept XMLHttpRequest
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...args) {
+        const proxiedUrl = proxyUrl(url);
+        console.log('XHR intercepted:', url, '->', proxiedUrl);
+        return originalOpen.call(this, method, proxiedUrl, ...args);
+    };
+    
+    // Intercept dynamic script/link/img creation
+    const originalSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+        if ((name === 'src' || name === 'href') && typeof value === 'string') {
+            const proxiedValue = proxyUrl(value);
+            if (proxiedValue !== value) {
+                console.log('Property ' + name + ' set:', proxiedValue);
+            }
+            return originalSetAttribute.call(this, name, proxiedValue);
+        }
+        return originalSetAttribute.call(this, name, value);
+    };
+    
+    console.log('Debug logging and URL interception enabled');
+    console.log('=============================');
+})();
+</script>
+"""
+                    # Inject before </body> or at end
+                    if '</body>' in body:
+                        body = body.replace('</body>', debug_script + '</body>')
+                    else:
+                        body += debug_script
+                    
+                    response_headers = {
+                        'Content-Type': content_type,
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                        'Access-Control-Allow-Headers': '*',
+                        'X-Frame-Options': 'ALLOWALL',
+                        'Content-Security-Policy': "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'; img-src * data: blob:; font-src * data:; connect-src *; frame-src *;"
+                    }
+                    
+                    # Forward Set-Cookie headers if present
+                    set_cookie_headers = response.headers.get_all('Set-Cookie')
+                    if set_cookie_headers:
+                        return {
+                            'statusCode': response.status,
+                            'headers': response_headers,
+                            'multiValueHeaders': {
+                                'Set-Cookie': set_cookie_headers
+                            },
+                            'body': body
+                        }
+                    
+                    return {
+                        'statusCode': response.status,
+                        'headers': response_headers,
+                        'body': body
+                    }
+                
+                # For CSS, rewrite URLs
+                if 'text/css' in content_type and is_text:
+                    def rewrite_css_url(match):
+                        url = match.group(1).strip('\'"')
+                        if url.startswith('data:') or url.startswith('#'):
+                            return match.group(0)
+                        # Make absolute
+                        if url.startswith('//'):
+                            url = parsed_url.scheme + ':' + url
+                        elif url.startswith('/'):
+                            url = parsed_url.scheme + '://' + parsed_url.netloc + url
+                        elif not url.startswith('http'):
+                            url = urllib.parse.urljoin(request_url, url)
+                        # Proxy it
+                        proxy_url = proxy_base_url + '/debug?url=' + urllib.parse.quote(url, safe='') + '&inline=true'
+                        return 'url("' + proxy_url + '")'
+                    
+                    body = re.sub(r'url\(([^)]+)\)', rewrite_css_url, body)
+                    
                     return {
                         'statusCode': response.status,
                         'headers': {
@@ -225,301 +470,25 @@ def lambda_handler(event, context):
                             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
                             'Access-Control-Allow-Headers': '*',
                         },
-                        'body': base64.b64encode(body).decode('utf-8'),
+                        'body': body
+                    }
+                
+                # For binary content (images, fonts, etc.), return as base64
+                if not is_text:
+                    body_base64 = base64.b64encode(response_data).decode('utf-8')
+                    return {
+                        'statusCode': response.status,
+                        'headers': {
+                            'Content-Type': content_type,
+                            'Access-Control-Allow-Origin': '*',
+                            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                            'Access-Control-Allow-Headers': '*',
+                        },
+                        'body': body_base64,
                         'isBase64Encoded': True
                     }
-            else:
-                body = response.read(102400).decode('utf-8', errors='replace')
-            
-            # If inline mode, return the HTML directly
-            if inline_mode and 'text/html' in content_type:
-                # Rewrite all URLs to go through proxy
-                body = rewrite_urls(body, request_url, proxy_base_url)
                 
-                # Add VERY early stage interceptor - must run before ANYTHING else
-                early_interceptor = '''<script>
-(function() {{
-    // Store original values IMMEDIATELY
-    var ORIGINAL_URL = "{orig_url}";
-    var PROXY_BASE = "{proxy_base}";
-    var parsed = new URL(ORIGINAL_URL);
-    var ORIGINAL_ORIGIN = parsed.protocol + "//" + parsed.hostname;
-    
-    // Override document.write to catch any inline writes
-    var originalWrite = document.write;
-    document.write = function(html) {{
-        // Don't proxy yet - let HTML load
-        return originalWrite.call(document, html);
-    }};
-    
-    // Override setAttribute to catch dynamic attribute changes
-    var originalSetAttribute = Element.prototype.setAttribute;
-    Element.prototype.setAttribute = function(name, value) {{
-        if ((name === 'src' || name === 'href') && typeof value === 'string') {{
-            if (!value.startsWith('data:') && !value.startsWith('javascript:') && !value.startsWith('#') && !value.startsWith('blob:') && !value.includes('/debug?site=')) {{
-                var absolute;
-                if (value.startsWith('//')) {{
-                    absolute = parsed.protocol + value;
-                }} else if (value.startsWith('/')) {{
-                    absolute = ORIGINAL_ORIGIN + value;
-                }} else if (value.startsWith('http')) {{
-                    absolute = value;
-                }} else {{
-                    try {{
-                        absolute = new URL(value, ORIGINAL_URL).href;
-                    }} catch(e) {{
-                        absolute = value;
-                    }}
-                }}
-                value = PROXY_BASE + '/debug?site=' + encodeURIComponent(absolute) + '&inline=true';
-                console.log('setAttribute intercepted:', name, '->', value.substring(0, 100));
-            }}
-        }}
-        return originalSetAttribute.call(this, name, value);
-    }};
-    
-    // Override .src and .href property setters
-    function wrapProperty(proto, prop) {{
-        var desc = Object.getOwnPropertyDescriptor(proto, prop);
-        if (!desc || !desc.set) return;
-        
-        var originalSet = desc.set;
-        Object.defineProperty(proto, prop, {{
-            set: function(value) {{
-                if (typeof value === 'string' && !value.startsWith('data:') && !value.startsWith('javascript:') && !value.startsWith('#') && !value.startsWith('blob:') && !value.includes('/debug?site=')) {{
-                    var absolute;
-                    if (value.startsWith('//')) {{
-                        absolute = parsed.protocol + value;
-                    }} else if (value.startsWith('/')) {{
-                        absolute = ORIGINAL_ORIGIN + value;
-                    }} else if (value.startsWith('http')) {{
-                        absolute = value;
-                    }} else {{
-                        try {{
-                            absolute = new URL(value, ORIGINAL_URL).href;
-                        }} catch(e) {{
-                            absolute = value;
-                        }}
-                    }}
-                    value = PROXY_BASE + '/debug?site=' + encodeURIComponent(absolute) + '&inline=true';
-                    console.log('Property', prop, 'set:', value.substring(0, 100));
-                }}
-                return originalSet.call(this, value);
-            }},
-            get: desc.get,
-            enumerable: desc.enumerable,
-            configurable: desc.configurable
-        }});
-    }}
-    
-    // Wrap properties on various element types
-    try {{
-        wrapProperty(HTMLImageElement.prototype, 'src');
-        wrapProperty(HTMLScriptElement.prototype, 'src');
-        wrapProperty(HTMLIFrameElement.prototype, 'src');
-        wrapProperty(HTMLSourceElement.prototype, 'src');
-        wrapProperty(HTMLEmbedElement.prototype, 'src');
-        wrapProperty(HTMLAnchorElement.prototype, 'href');
-        wrapProperty(HTMLLinkElement.prototype, 'href');
-    }} catch(e) {{
-        console.error('Error wrapping properties:', e);
-    }}
-    
-    console.log('Early interception initialized for:', ORIGINAL_URL);
-}})();
-</script>
-'''.format(orig_url=request_url, proxy_base=proxy_base_url)
-                
-                # Add debug console logging script and URL interceptor
-                trace_info = ""
-                if trace_mode:
-                    trace_info = '''
-    // TRACE MODE ENABLED
-    console.log("\\n=== TRACE LOG ===");
-    console.log("Request Duration:", {duration_ms}, "ms");
-    console.log("Response Status:", {status}, "{status_text}");
-    console.log("Response Headers:", {response_headers});
-    console.log("Content Type:", "{content_type}");
-    console.log("Body Size:", {body_size}, "bytes");
-    console.log("=================\\n");
-'''.format(
-                        duration_ms=duration_ms,
-                        status=response.status,
-                        status_text=response.reason,
-                        response_headers=json.dumps(dict(response.headers)),
-                        content_type=content_type,
-                        body_size=len(body)
-                    )
-                
-                debug_script = '''<script>
-(function() {{
-    var ORIGINAL_URL = "{orig_url}";
-    var PROXY_BASE = "{proxy_base}";
-    var parsed = new URL(ORIGINAL_URL);
-    var ORIGINAL_ORIGIN = parsed.protocol + "//" + parsed.hostname;
-    
-    console.log("=== TLS Debug Inline Mode ===");
-    console.log("Original URL:", ORIGINAL_URL);
-    console.log("Original Origin:", ORIGINAL_ORIGIN);
-    console.log("All resources are being proxied");
-    console.log("Proxy URL:", window.location.href);
-    {trace_info}
-    
-    // Function to convert URL to proxied version
-    function proxyUrl(url) {{
-        if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#') || url.startsWith('blob:')) {{
-            return url;
-        }}
-        
-        // Already proxied?
-        if (url.includes('/debug?site=')) {{
-            return url;
-        }}
-        
-        // Make absolute
-        var absoluteUrl;
-        try {{
-            if (url.startsWith('//')) {{
-                absoluteUrl = parsed.protocol + url;
-            }} else if (url.startsWith('/')) {{
-                absoluteUrl = ORIGINAL_ORIGIN + url;
-            }} else if (url.startsWith('http')) {{
-                absoluteUrl = url;
-            }} else {{
-                absoluteUrl = new URL(url, ORIGINAL_URL).href;
-            }}
-        }} catch(e) {{
-            return url;
-        }}
-        
-        // Proxy it
-        return PROXY_BASE + '/debug?site=' + encodeURIComponent(absoluteUrl) + '&inline=true';
-    }}
-    
-    // Intercept all clicks
-    document.addEventListener('click', function(e) {{
-        var target = e.target;
-        while (target && target.tagName !== 'A') {{
-            target = target.parentElement;
-        }}
-        if (target && target.href) {{
-            var original = target.getAttribute('href');
-            if (original && !original.startsWith('#') && !original.startsWith('javascript:')) {{
-                e.preventDefault();
-                var proxied = proxyUrl(original);
-                console.log("Click intercepted:", original, "->", proxied);
-                window.location.href = proxied;
-            }}
-        }}
-    }}, true);
-    
-    // Intercept dynamic script/img creation
-    var originalCreateElement = document.createElement;
-    document.createElement = function(tagName) {{
-        var element = originalCreateElement.call(document, tagName);
-        if (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'img') {{
-            var srcDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'src') || 
-                               Object.getOwnPropertyDescriptor(Element.prototype, 'src');
-            if (srcDescriptor && srcDescriptor.set) {{
-                var originalSetter = srcDescriptor.set;
-                Object.defineProperty(element, 'src', {{
-                    set: function(value) {{
-                        var proxied = proxyUrl(value);
-                        console.log("Dynamic src set:", value, "->", proxied);
-                        originalSetter.call(this, proxied);
-                    }},
-                    get: srcDescriptor.get
-                }});
-            }}
-        }}
-        return element;
-    }};
-    
-    // Intercept fetch API
-    var originalFetch = window.fetch;
-    window.fetch = function(url, options) {{
-        var proxied = proxyUrl(url);
-        console.log("Fetch intercepted:", url, "->", proxied);
-        return originalFetch.call(this, proxied, options);
-    }};
-    
-    // Intercept XMLHttpRequest
-    var originalOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {{
-        var proxied = proxyUrl(url);
-        console.log("XHR intercepted:", url, "->", proxied);
-        return originalOpen.apply(this, [method, proxied].concat(Array.prototype.slice.call(arguments, 2)));
-    }};
-    
-    window.addEventListener('load', function() {{
-        console.log("Page fully loaded");
-        console.log("Scripts:", document.scripts.length);
-        console.log("Stylesheets:", document.styleSheets.length);
-        console.log("Images:", document.images.length);
-    }});
-    
-    window.addEventListener('error', function(e) {{
-        console.error("Resource failed to load:", e.target.src || e.target.href || e.message);
-    }}, true);
-    
-    window.addEventListener('securitypolicyviolation', function(e) {{
-        console.error("Security Policy Violation:", e.violatedDirective, e.blockedURI);
-    }});
-    
-    console.log("Debug logging and URL interception enabled");
-    console.log("=============================");
-}})();
-</script>
-'''.format(orig_url=request_url, proxy_base=proxy_base_url, trace_info=trace_info)
-                
-                # Insert early interceptor and debug script after <head> tag
-                if '<head>' in body.lower():
-                    body_lower = body.lower()
-                    head_pos = body_lower.find('<head>') + 6
-                    body = body[:head_pos] + early_interceptor + debug_script + body[head_pos:]
-                elif '<html>' in body.lower():
-                    body_lower = body.lower()
-                    html_pos = body_lower.find('<html>') + 6
-                    body = body[:html_pos] + '<head>' + early_interceptor + debug_script + '</head>' + body[html_pos:]
-                else:
-                    body = early_interceptor + debug_script + body
-                
-                return {
-                    'statusCode': response.status,
-                    'headers': {
-                        'Content-Type': response.headers.get('Content-Type', 'text/html'),
-                        'Access-Control-Allow-Origin': '*',
-                        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                        'Access-Control-Allow-Headers': '*',
-                        'Access-Control-Expose-Headers': '*',
-                        'Access-Control-Allow-Credentials': 'true',
-                        'X-Content-Type-Options': 'nosniff',
-                        'X-Frame-Options': 'ALLOWALL',
-                        'Content-Security-Policy': "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval'; style-src * 'unsafe-inline'; img-src * data: blob:; font-src * data:; connect-src *; frame-src *;"
-                    },
-                    'body': body
-                }
-            
-            # If inline mode and CSS, rewrite URLs in CSS
-            if inline_mode and 'text/css' in content_type:
-                # Rewrite url() in CSS
-                def rewrite_css_url(match):
-                    url = match.group(1).strip('\'"')
-                    if url.startswith('data:') or url.startswith('#'):
-                        return match.group(0)
-                    # Make absolute
-                    if url.startswith('//'):
-                        url = parsed_url.scheme + ':' + url
-                    elif url.startswith('/'):
-                        url = parsed_url.scheme + '://' + parsed_url.netloc + url
-                    elif not url.startswith('http'):
-                        url = urllib.parse.urljoin(request_url, url)
-                    # Proxy it - always use /debug path
-                    proxy_url = proxy_base_url + '/debug?site=' + urllib.parse.quote(url, safe='') + '&inline=true'
-                    return 'url("' + proxy_url + '")'
-                
-                body = re.sub(r'url\(([^)]+)\)', rewrite_css_url, body)
-                
+                # For other text content (JS, etc.), return as-is
                 return {
                     'statusCode': response.status,
                     'headers': {
@@ -531,36 +500,23 @@ def lambda_handler(event, context):
                     'body': body
                 }
             
-            # If inline mode and JS/other text, return as-is
-            if inline_mode:
-                return {
-                    'statusCode': response.status,
-                    'headers': {
-                        'Content-Type': content_type,
-                        'Access-Control-Allow-Origin': '*',
-                        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                        'Access-Control-Allow-Headers': '*',
-                    },
-                    'body': body
-                }
-            
-            # Capture response details
+            # Non-inline mode: return JSON debug info
             response_details = {
                 'status_code': response.status,
                 'status_message': response.reason,
                 'headers': dict(response.headers),
-                'body_preview': body[:1000] if len(body) > 1000 else body,
-                'body_size': len(body),
-                'truncated': len(body) > 1000,
-                'duration_ms': duration_ms
+                'body_preview': body[:1000] if is_text else base64.b64encode(response_data[:1000]).decode('utf-8'),
+                'body_size': len(response_data),
+                'truncated': len(response_data) > 1000,
+                'duration_ms': duration_ms,
+                'is_binary': not is_text
             }
             
-            # Add final trace log
             if trace_mode:
                 trace_log.append({
                     'event': 'processing_complete',
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
-                    'body_size': len(body),
+                    'body_size': len(response_data),
                     'content_type': content_type
                 })
             
@@ -588,7 +544,6 @@ def lambda_handler(event, context):
                 'success': True
             }
             
-            # Add trace log if trace mode enabled
             if trace_mode:
                 response_object['trace'] = trace_log
             
@@ -602,7 +557,7 @@ def lambda_handler(event, context):
             }
             
     except urllib.error.HTTPError as e:
-        # If inline mode, try to return error page HTML if available
+        # If inline mode, try to return error page HTML
         if inline_mode:
             try:
                 error_body = e.read().decode('utf-8', errors='replace')
@@ -624,28 +579,19 @@ def lambda_handler(event, context):
                     'body': str(e.reason)
                 }
         
-        # Add error to trace log
-        if trace_mode:
-            trace_log.append({
-                'event': 'error',
-                'timestamp': datetime.utcnow().isoformat() + 'Z',
-                'error_type': 'HTTPError',
-                'status_code': e.code,
-                'error_message': str(e.reason)
-            })
-        
+        # JSON error response
         error_response = {
-            'request': request_details,
+            'request': request_details if 'request_details' in locals() else {},
             'response': {
                 'status_code': e.code,
                 'status_message': e.reason,
-                'headers': dict(e.headers),
+                'headers': dict(e.headers) if hasattr(e, 'headers') else {},
                 'error': str(e)
             },
             'success': False
         }
         
-        if trace_mode:
+        if 'trace_log' in locals() and trace_mode:
             error_response['trace'] = trace_log
         
         return {
@@ -656,6 +602,7 @@ def lambda_handler(event, context):
             },
             'body': json.dumps(error_response, indent=2)
         }
+        
     except Exception as e:
         # Build error response
         error_response = {
@@ -664,7 +611,6 @@ def lambda_handler(event, context):
             'success': False
         }
         
-        # Add trace log if it exists and trace mode was enabled
         if 'trace_log' in locals() and trace_mode:
             trace_log.append({
                 'event': 'error',
@@ -675,7 +621,7 @@ def lambda_handler(event, context):
             error_response['trace'] = trace_log
         
         return {
-            'statusCode': 200,
+            'statusCode': 500,
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*'
