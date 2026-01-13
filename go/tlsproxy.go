@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -362,6 +363,160 @@ func (m *PathFilterModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
+// StringReplacementModule replaces strings in request/response bodies
+type StringReplacementModule struct {
+	Replacements map[string]string // old -> new
+}
+
+func (m *StringReplacementModule) Name() string {
+	return "StringReplacement"
+}
+
+func (m *StringReplacementModule) ShouldLog(req *http.Request) bool {
+	return true
+}
+
+func (m *StringReplacementModule) ProcessRequest(req *http.Request) error {
+	if req.Body == nil {
+		return nil
+	}
+
+	// Only process text content types
+	contentType := req.Header.Get("Content-Type")
+	if contentType != "" {
+		isText := strings.Contains(contentType, "text/") ||
+			strings.Contains(contentType, "application/json") ||
+			strings.Contains(contentType, "application/xml") ||
+			strings.Contains(contentType, "application/x-www-form-urlencoded") ||
+			strings.Contains(contentType, "application/javascript")
+		
+		if !isText {
+			// Not text content, skip replacement
+			return nil
+		}
+	}
+
+	// Handle Content-Encoding (decompress if needed)
+	var reader io.Reader = req.Body
+	encoding := req.Header.Get("Content-Encoding")
+	
+	if encoding == "gzip" {
+		gzipReader, err := gzip.NewReader(req.Body)
+		if err != nil {
+			// Not valid gzip, try reading as-is
+			log.Printf("[StringReplacement] Warning: Failed to decompress gzip request: %v", err)
+			reader = req.Body
+		} else {
+			reader = gzipReader
+			defer gzipReader.Close()
+		}
+	}
+
+	// Read the body (decompressed if it was compressed)
+	bodyBytes, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+
+	// Close the original body
+	req.Body.Close()
+
+	// Apply replacements
+	bodyStr := string(bodyBytes)
+	modified := false
+	for old, new := range m.Replacements {
+		if strings.Contains(bodyStr, old) {
+			count := strings.Count(bodyStr, old)
+			bodyStr = strings.ReplaceAll(bodyStr, old, new)
+			modified = true
+			log.Printf("[StringReplacement] Request: Replaced '%s' with '%s' (%d occurrences)", old, new, count)
+		}
+	}
+
+	// Create new body with modified content (uncompressed)
+	req.Body = io.NopCloser(bytes.NewBufferString(bodyStr))
+	req.ContentLength = int64(len(bodyStr))
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyStr)))
+	
+	// Remove Content-Encoding since we're returning uncompressed data
+	if encoding != "" {
+		req.Header.Del("Content-Encoding")
+		log.Printf("[StringReplacement] Removed Content-Encoding: %s (returning uncompressed)", encoding)
+	}
+
+	return nil
+}
+
+func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
+	if resp.Body == nil {
+		return nil
+	}
+
+	// Only process text content types
+	contentType := resp.Header.Get("Content-Type")
+	if contentType != "" {
+		isText := strings.Contains(contentType, "text/") ||
+			strings.Contains(contentType, "application/json") ||
+			strings.Contains(contentType, "application/xml") ||
+			strings.Contains(contentType, "application/javascript")
+		
+		if !isText {
+			// Not text content, skip replacement
+			return nil
+		}
+	}
+
+	// Handle Content-Encoding (decompress if needed)
+	var reader io.Reader = resp.Body
+	encoding := resp.Header.Get("Content-Encoding")
+	
+	if encoding == "gzip" {
+		gzipReader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			// Not valid gzip, try reading as-is
+			log.Printf("[StringReplacement] Warning: Failed to decompress gzip response: %v", err)
+			reader = resp.Body
+		} else {
+			reader = gzipReader
+			defer gzipReader.Close()
+		}
+	}
+
+	// Read the body (decompressed if it was compressed)
+	bodyBytes, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+
+	// Close the original body
+	resp.Body.Close()
+
+	// Apply replacements
+	bodyStr := string(bodyBytes)
+	modified := false
+	for old, new := range m.Replacements {
+		if strings.Contains(bodyStr, old) {
+			count := strings.Count(bodyStr, old)
+			bodyStr = strings.ReplaceAll(bodyStr, old, new)
+			modified = true
+			log.Printf("[StringReplacement] Response: Replaced '%s' with '%s' (%d occurrences)", old, new, count)
+		}
+	}
+
+	// Create new body with modified content (uncompressed)
+	resp.Body = io.NopCloser(bytes.NewBufferString(bodyStr))
+	resp.ContentLength = int64(len(bodyStr))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyStr)))
+	
+	// Remove Content-Encoding since we're returning uncompressed data
+	if encoding != "" {
+		resp.Header.Del("Content-Encoding")
+		log.Printf("[StringReplacement] Removed Content-Encoding: %s (returning uncompressed)", encoding)
+	}
+
+	return nil
+}
+
 func main() {
 	port := flag.Int("port", 8080, "Proxy port")
 	cleanup := flag.Bool("cleanup", false, "Remove CA certificates and exit")
@@ -453,6 +608,15 @@ func initializeModules() {
 	// 		"X-Proxy-Modified": "true",
 	// 	},
 	// 	RemoveHeaders: []string{"Server"},
+	// })
+	
+	// Uncomment to replace strings in request/response bodies:
+	// RegisterModule(&StringReplacementModule{
+	// 	Replacements: map[string]string{
+	// 		"cyber":    "kitten",
+	// 		"hacker":   "cat lover",
+	// 		"security": "cuddles",
+	// 	},
 	// })
 	
 	log.Printf("Total modules registered: %d", len(logModules))
