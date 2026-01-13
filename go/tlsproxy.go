@@ -423,12 +423,10 @@ func (m *StringReplacementModule) ProcessRequest(req *http.Request) error {
 
 	// Apply replacements
 	bodyStr := string(bodyBytes)
-	modified := false
 	for old, new := range m.Replacements {
 		if strings.Contains(bodyStr, old) {
 			count := strings.Count(bodyStr, old)
 			bodyStr = strings.ReplaceAll(bodyStr, old, new)
-			modified = true
 			log.Printf("[StringReplacement] Request: Replaced '%s' with '%s' (%d occurrences)", old, new, count)
 		}
 	}
@@ -467,8 +465,16 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 	}
 
 	// Handle Content-Encoding (decompress if needed)
-	var reader io.Reader = resp.Body
 	encoding := resp.Header.Get("Content-Encoding")
+	
+	// Skip unsupported compression formats
+	if encoding == "br" || encoding == "zstd" || encoding == "deflate" {
+		log.Printf("[StringReplacement] Warning: Skipping response with unsupported compression: %s (only gzip is supported)", encoding)
+		log.Printf("[StringReplacement] Tip: To enable replacements, disable %s in browser or use Accept-Encoding header filter", encoding)
+		return nil
+	}
+	
+	var reader io.Reader = resp.Body
 	
 	if encoding == "gzip" {
 		gzipReader, err := gzip.NewReader(resp.Body)
@@ -493,12 +499,10 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 
 	// Apply replacements
 	bodyStr := string(bodyBytes)
-	modified := false
 	for old, new := range m.Replacements {
 		if strings.Contains(bodyStr, old) {
 			count := strings.Count(bodyStr, old)
 			bodyStr = strings.ReplaceAll(bodyStr, old, new)
-			modified = true
 			log.Printf("[StringReplacement] Response: Replaced '%s' with '%s' (%d occurrences)", old, new, count)
 		}
 	}
@@ -509,11 +513,61 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(bodyStr)))
 	
 	// Remove Content-Encoding since we're returning uncompressed data
-	if encoding != "" {
+	if encoding != "" && encoding != "br" && encoding != "zstd" && encoding != "deflate" {
 		resp.Header.Del("Content-Encoding")
 		log.Printf("[StringReplacement] Removed Content-Encoding: %s (returning uncompressed)", encoding)
 	}
 
+	return nil
+}
+
+// ForceGzipModule removes Brotli from Accept-Encoding to force servers to use gzip
+type ForceGzipModule struct{}
+
+func (m *ForceGzipModule) Name() string {
+	return "ForceGzip"
+}
+
+func (m *ForceGzipModule) ShouldLog(req *http.Request) bool {
+	return true
+}
+
+func (m *ForceGzipModule) ProcessRequest(req *http.Request) error {
+	// Get current Accept-Encoding
+	acceptEncoding := req.Header.Get("Accept-Encoding")
+	
+	if acceptEncoding == "" {
+		return nil
+	}
+	
+	// Remove br (Brotli), zstd, and deflate - keep only gzip
+	encodings := strings.Split(acceptEncoding, ",")
+	var supported []string
+	
+	for _, enc := range encodings {
+		enc = strings.TrimSpace(enc)
+		// Keep gzip and identity, remove others
+		if strings.Contains(enc, "gzip") || enc == "identity" {
+			supported = append(supported, enc)
+		}
+	}
+	
+	if len(supported) == 0 {
+		// If nothing left, request gzip explicitly
+		supported = []string{"gzip"}
+	}
+	
+	newAcceptEncoding := strings.Join(supported, ", ")
+	
+	if newAcceptEncoding != acceptEncoding {
+		req.Header.Set("Accept-Encoding", newAcceptEncoding)
+		log.Printf("[ForceGzip] Modified Accept-Encoding from '%s' to '%s'", acceptEncoding, newAcceptEncoding)
+	}
+	
+	return nil
+}
+
+func (m *ForceGzipModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
@@ -611,6 +665,8 @@ func initializeModules() {
 	// })
 	
 	// Uncomment to replace strings in request/response bodies:
+	// NOTE: Also enable ForceGzip module to handle Brotli compression
+	// RegisterModule(&ForceGzipModule{})
 	// RegisterModule(&StringReplacementModule{
 	// 	Replacements: map[string]string{
 	// 		"cyber":    "kitten",
