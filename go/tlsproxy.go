@@ -9,6 +9,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -38,6 +40,7 @@ type ProxyConfig struct {
 	CertDir     string
 	LogFile     string
 	SkipInstall bool
+	Verbose     bool
 }
 
 type CertConfig struct {
@@ -83,7 +86,6 @@ var (
 	logModules  []LogModule
 )
 
-// LogModule interface for extensible logging and traffic modification
 type LogModule interface {
 	Name() string
 	ShouldLog(req *http.Request) bool
@@ -120,7 +122,6 @@ func executeModulesResponse(resp *http.Response) error {
 	return nil
 }
 
-// sanitizeForConsole replaces non-printable characters to prevent terminal beeping
 func sanitizeForConsole(data string) string {
 	var result strings.Builder
 	result.Grow(len(data))
@@ -521,7 +522,6 @@ func (m *StringReplacementModule) ProcessResponse(resp *http.Response) error {
 	return nil
 }
 
-// ForceGzipModule removes Brotli from Accept-Encoding to force servers to use gzip
 type ForceGzipModule struct{}
 
 func (m *ForceGzipModule) Name() string {
@@ -576,6 +576,7 @@ func main() {
 	cleanup := flag.Bool("cleanup", false, "Remove CA certificates and exit")
 	certDir := flag.String("certdir", ".", "Certificate directory")
 	skipInstall := flag.Bool("skip-install", false, "Skip automatic certificate installation")
+	verbose := flag.Bool("verbose", false, "Show detailed cookie and session token information")
 	configFile := flag.String("config", "proxy-config.ini", "Configuration file path")
 	flag.Parse()
 
@@ -587,6 +588,7 @@ func main() {
 		CertDir:     *certDir,
 		LogFile:     filepath.Join(*certDir, logFile),
 		SkipInstall: *skipInstall,
+		Verbose:     *verbose,
 	}
 
 	if *cleanup {
@@ -1129,6 +1131,203 @@ func forwardRequest(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// isJWT checks if a string looks like a JWT token
+func isJWT(token string) bool {
+	// JWT format: header.payload.signature
+	parts := strings.Split(token, ".")
+	return len(parts) == 3
+}
+
+// parseJWT attempts to decode and display JWT claims (header and payload only)
+func parseJWT(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	
+	var result strings.Builder
+	result.WriteString("    [JWT Token Detected]\n")
+	
+	// Decode header
+	if headerJSON, err := base64Decode(parts[0]); err == nil {
+		result.WriteString(fmt.Sprintf("    JWT Header: %s\n", headerJSON))
+	}
+	
+	// Decode payload (claims)
+	if payloadJSON, err := base64Decode(parts[1]); err == nil {
+		result.WriteString(fmt.Sprintf("    JWT Payload: %s\n", payloadJSON))
+		
+		// Try to extract common claims
+		var claims map[string]interface{}
+		if err := json.Unmarshal([]byte(payloadJSON), &claims); err == nil {
+			if exp, ok := claims["exp"].(float64); ok {
+				expTime := time.Unix(int64(exp), 0)
+				result.WriteString(fmt.Sprintf("    Expires: %s\n", expTime.Format(time.RFC3339)))
+				if time.Now().After(expTime) {
+					result.WriteString("    Status: EXPIRED\n")
+				} else {
+					result.WriteString(fmt.Sprintf("    Status: Valid (expires in %s)\n", time.Until(expTime).Round(time.Second)))
+				}
+			}
+			if iss, ok := claims["iss"].(string); ok {
+				result.WriteString(fmt.Sprintf("    Issuer: %s\n", iss))
+			}
+			if sub, ok := claims["sub"].(string); ok {
+				result.WriteString(fmt.Sprintf("    Subject: %s\n", sub))
+			}
+			if aud, ok := claims["aud"]; ok {
+				result.WriteString(fmt.Sprintf("    Audience: %v\n", aud))
+			}
+			if iat, ok := claims["iat"].(float64); ok {
+				iatTime := time.Unix(int64(iat), 0)
+				result.WriteString(fmt.Sprintf("    Issued At: %s\n", iatTime.Format(time.RFC3339)))
+			}
+		}
+	}
+	
+	// Show partial signature (first 20 chars)
+	if len(parts[2]) > 20 {
+		result.WriteString(fmt.Sprintf("    Signature: %s...\n", parts[2][:20]))
+	} else {
+		result.WriteString(fmt.Sprintf("    Signature: %s\n", parts[2]))
+	}
+	
+	return result.String()
+}
+
+// base64Decode decodes base64url or standard base64
+func base64Decode(encoded string) (string, error) {
+	// JWT uses base64url encoding (no padding)
+	encoded = strings.ReplaceAll(encoded, "-", "+")
+	encoded = strings.ReplaceAll(encoded, "_", "/")
+	
+	// Add padding if needed
+	switch len(encoded) % 4 {
+	case 2:
+		encoded += "=="
+	case 3:
+		encoded += "="
+	}
+	
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	
+	return string(decoded), nil
+}
+
+type EditThisCookieFormat struct {
+	Domain         string  `json:"domain"`
+	ExpirationDate float64 `json:"expirationDate,omitempty"`
+	HostOnly       bool    `json:"hostOnly"`
+	HttpOnly       bool    `json:"httpOnly"`
+	Name           string  `json:"name"`
+	Path           string  `json:"path"`
+	SameSite       string  `json:"sameSite"`
+	Secure         bool    `json:"secure"`
+	Session        bool    `json:"session"`
+	StoreId        string  `json:"storeId"`
+	Value          string  `json:"value"`
+}
+
+type SessionExport struct {
+	Timestamp   string                  `json:"timestamp"`
+	URL         string                  `json:"url"`
+	Cookies     []EditThisCookieFormat  `json:"cookies"`
+	AuthHeaders map[string]string       `json:"auth_headers"`
+	SessionData map[string]string       `json:"session_data"`
+}
+
+func exportToEditThisCookie(req *http.Request) {
+	cookies := req.Cookies()
+	if len(cookies) == 0 && req.Header.Get("Authorization") == "" {
+		return
+	}
+
+	exportData := SessionExport{
+		Timestamp:   time.Now().Format(time.RFC3339),
+		URL:         req.URL.String(),
+		Cookies:     make([]EditThisCookieFormat, 0),
+		AuthHeaders: make(map[string]string),
+		SessionData: make(map[string]string),
+	}
+
+	// Convert cookies to EditThisCookie format
+	for _, cookie := range cookies {
+		sameSite := "unspecified"
+		switch cookie.SameSite {
+		case http.SameSiteStrictMode:
+			sameSite = "strict"
+		case http.SameSiteLaxMode:
+			sameSite = "lax"
+		case http.SameSiteNoneMode:
+			sameSite = "no_restriction"
+		}
+
+		etcCookie := EditThisCookieFormat{
+			Domain:   cookie.Domain,
+			HostOnly: cookie.Domain == "",
+			HttpOnly: cookie.HttpOnly,
+			Name:     cookie.Name,
+			Path:     cookie.Path,
+			SameSite: sameSite,
+			Secure:   cookie.Secure,
+			Session:  cookie.MaxAge == 0 && cookie.Expires.IsZero(),
+			StoreId:  "0",
+			Value:    cookie.Value,
+		}
+
+		if !cookie.Expires.IsZero() {
+			etcCookie.ExpirationDate = float64(cookie.Expires.Unix())
+		}
+
+		exportData.Cookies = append(exportData.Cookies, etcCookie)
+	}
+
+	// Capture auth headers
+	if auth := req.Header.Get("Authorization"); auth != "" {
+		exportData.AuthHeaders["Authorization"] = auth
+	}
+	sessionHeaders := []string{
+		"X-Auth-Token", "X-API-Key", "X-Session-ID", "X-CSRF-Token",
+		"X-Request-ID", "X-Correlation-ID", "X-Access-Token",
+	}
+	for _, header := range sessionHeaders {
+		if value := req.Header.Get(header); value != "" {
+			exportData.AuthHeaders[header] = value
+		}
+	}
+
+	// Extract OAuth/session data from URL parameters
+	query := req.URL.Query()
+	for key, values := range query {
+		lowerKey := strings.ToLower(key)
+		if strings.Contains(lowerKey, "token") || strings.Contains(lowerKey, "session") ||
+			strings.Contains(lowerKey, "auth") || strings.Contains(lowerKey, "key") {
+			exportData.SessionData[key] = strings.Join(values, ",")
+		}
+	}
+
+	// Write to EditThisCookie_Sessions.json
+	filename := "EditThisCookie_Sessions.json"
+	var existingData []SessionExport
+
+	// Read existing data if file exists
+	if data, err := os.ReadFile(filename); err == nil {
+		json.Unmarshal(data, &existingData)
+	}
+
+	// Append new session
+	existingData = append(existingData, exportData)
+
+	// Write back
+	if jsonData, err := json.MarshalIndent(existingData, "", "  "); err == nil {
+		os.WriteFile(filename, jsonData, 0644)
+		log.Printf("[EXPORT] Session exported to %s", filename)
+	}
+}
+
 func logRequest(req *http.Request, config *ProxyConfig) {
 	// Check if any module wants to log this request
 	shouldLog := executeModules(req)
@@ -1149,6 +1348,87 @@ func logRequest(req *http.Request, config *ProxyConfig) {
 		for _, value := range values {
 			logEntry = logEntry + fmt.Sprintf("  %s: %s\n", name, value)
 		}
+	}
+
+	// Verbose mode: Show detailed cookie and session information
+	if config.Verbose {
+		// Export to EditThisCookie format
+		exportToEditThisCookie(req)
+		
+		logEntry = logEntry + "\n--- VERBOSE: Cookie & Session Details ---\n"
+		
+		// Parse and display cookies
+		cookies := req.Cookies()
+		if len(cookies) > 0 {
+			logEntry = logEntry + fmt.Sprintf("Cookies (%d total):\n", len(cookies))
+			for _, cookie := range cookies {
+				logEntry = logEntry + fmt.Sprintf("  [Cookie] %s\n", cookie.Name)
+				logEntry = logEntry + fmt.Sprintf("    Value: %s\n", cookie.Value)
+				logEntry = logEntry + fmt.Sprintf("    Path: %s\n", cookie.Path)
+				logEntry = logEntry + fmt.Sprintf("    Domain: %s\n", cookie.Domain)
+				if !cookie.Expires.IsZero() {
+					logEntry = logEntry + fmt.Sprintf("    Expires: %s\n", cookie.Expires.Format(time.RFC3339))
+				}
+				if cookie.MaxAge > 0 {
+					logEntry = logEntry + fmt.Sprintf("    MaxAge: %d seconds\n", cookie.MaxAge)
+				}
+				logEntry = logEntry + fmt.Sprintf("    Secure: %v\n", cookie.Secure)
+				logEntry = logEntry + fmt.Sprintf("    HttpOnly: %v\n", cookie.HttpOnly)
+				if cookie.SameSite != 0 {
+					logEntry = logEntry + fmt.Sprintf("    SameSite: %v\n", cookie.SameSite)
+				}
+				
+				// Try to decode JWT if it looks like one
+				if isJWT(cookie.Value) {
+					logEntry = logEntry + parseJWT(cookie.Value)
+				}
+				logEntry = logEntry + "\n"
+			}
+		} else {
+			logEntry = logEntry + "Cookies: None\n"
+		}
+		
+		// Display Authorization header details
+		if authHeader := req.Header.Get("Authorization"); authHeader != "" {
+			logEntry = logEntry + "\n[Authorization Header]\n"
+			logEntry = logEntry + fmt.Sprintf("  Full Value: %s\n", authHeader)
+			
+			// Parse Bearer tokens
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				token := strings.TrimPrefix(authHeader, "Bearer ")
+				logEntry = logEntry + fmt.Sprintf("  Type: Bearer Token\n")
+				logEntry = logEntry + fmt.Sprintf("  Token: %s\n", token)
+				
+				// Try to decode JWT
+				if isJWT(token) {
+					logEntry = logEntry + parseJWT(token)
+				}
+			} else if strings.HasPrefix(authHeader, "Basic ") {
+				logEntry = logEntry + fmt.Sprintf("  Type: Basic Authentication\n")
+				logEntry = logEntry + "  (Base64 encoded credentials)\n"
+			} else if strings.HasPrefix(authHeader, "Digest ") {
+				logEntry = logEntry + fmt.Sprintf("  Type: Digest Authentication\n")
+			}
+		}
+		
+		// Display other session-related headers
+		sessionHeaders := []string{
+			"X-Auth-Token", "X-API-Key", "X-Session-ID", "X-CSRF-Token",
+			"X-Request-ID", "X-Correlation-ID", "X-Access-Token",
+		}
+		
+		hasSessionHeaders := false
+		for _, header := range sessionHeaders {
+			if value := req.Header.Get(header); value != "" {
+				if !hasSessionHeaders {
+					logEntry = logEntry + "\n[Session-Related Headers]\n"
+					hasSessionHeaders = true
+				}
+				logEntry = logEntry + fmt.Sprintf("  %s: %s\n", header, value)
+			}
+		}
+		
+		logEntry = logEntry + "--- END VERBOSE ---\n\n"
 	}
 
 	if req.Method == http.MethodPost || req.Method == http.MethodPut {
@@ -1172,12 +1452,8 @@ func logRequest(req *http.Request, config *ProxyConfig) {
 					}
 				}
 			} else if len(bodyBytes) > 0 {
-				// Limit body size in logs
-				maxBodySize := 10240 // 10KB
+				// Full body logging - no truncation
 				bodyStr := string(bodyBytes)
-				if len(bodyBytes) > maxBodySize {
-					bodyStr = string(bodyBytes[:maxBodySize]) + fmt.Sprintf("... [truncated, %d more bytes]", len(bodyBytes)-maxBodySize)
-				}
 				logEntry = logEntry + fmt.Sprintf("Body: %s\n", bodyStr)
 			}
 		}
