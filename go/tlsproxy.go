@@ -619,6 +619,24 @@ func main() {
 	log.Printf("Proxy listening on port %d", config.Port)
 	log.Printf("CA certificate: %s", filepath.Join(config.CertDir, caCertFile))
 	log.Printf("Log file: %s", config.LogFile)
+	
+	if config.Verbose {
+		log.Printf("⚠️  VERBOSE MODE ENABLED - Session export active")
+		log.Printf("Sessions will be exported to: EditThisCookie_Sessions.json")
+		log.Printf("WARNING: This file will contain sensitive authentication data!")
+		
+		// Test write permissions
+		testFile := "EditThisCookie_Sessions.json"
+		testData := []EditThisCookieExport{}
+		if jsonData, err := json.MarshalIndent(testData, "", "    "); err == nil {
+			if err := os.WriteFile(testFile, jsonData, 0644); err == nil {
+				log.Printf("✓ Successfully initialized export file: %s", testFile)
+			} else {
+				log.Printf("❌ ERROR: Cannot write to %s: %v", testFile, err)
+				log.Printf("   Check directory permissions or run with different -certdir")
+			}
+		}
+	}
 
 	for {
 		conn, err := listener.Accept()
@@ -1049,6 +1067,11 @@ func handleConnect(clientConn net.Conn, req *http.Request, config *ProxyConfig) 
 			return
 		}
 
+		// Export response cookies if verbose mode
+		if config.Verbose {
+			exportResponseCookies(resp)
+		}
+
 		if err := resp.Write(tlsClientConn); err != nil {
 			log.Printf("Failed to write response: %v", err)
 			return
@@ -1074,6 +1097,11 @@ func handleHTTP(clientConn net.Conn, req *http.Request, config *ProxyConfig) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// Export response cookies if verbose mode
+	if config.Verbose {
+		exportResponseCookies(resp)
+	}
 
 	resp.Write(clientConn)
 }
@@ -1217,9 +1245,9 @@ func base64Decode(encoded string) (string, error) {
 	return string(decoded), nil
 }
 
-type EditThisCookieFormat struct {
+type EditThisCookieExport struct {
 	Domain         string  `json:"domain"`
-	ExpirationDate float64 `json:"expirationDate,omitempty"`
+	ExpirationDate float64 `json:"expirationDate"`
 	HostOnly       bool    `json:"hostOnly"`
 	HttpOnly       bool    `json:"httpOnly"`
 	Name           string  `json:"name"`
@@ -1231,30 +1259,41 @@ type EditThisCookieFormat struct {
 	Value          string  `json:"value"`
 }
 
-type SessionExport struct {
-	Timestamp   string                  `json:"timestamp"`
-	URL         string                  `json:"url"`
-	Cookies     []EditThisCookieFormat  `json:"cookies"`
-	AuthHeaders map[string]string       `json:"auth_headers"`
-	SessionData map[string]string       `json:"session_data"`
+func exportToEditThisCookie(req *http.Request) {
+	// Disabled: Request cookies (Cookie header) only have name+value
+	// They lack: domain, path, expires, secure, httpOnly, sameSite flags
+	// Only Set-Cookie headers (responses) have complete cookie properties
+	// All exports now happen via exportResponseCookies()
+	return
 }
 
-func exportToEditThisCookie(req *http.Request) {
-	cookies := req.Cookies()
-	if len(cookies) == 0 && req.Header.Get("Authorization") == "" {
+func exportResponseCookies(resp *http.Response) {
+	if resp == nil || resp.Header == nil {
 		return
 	}
 
-	exportData := SessionExport{
-		Timestamp:   time.Now().Format(time.RFC3339),
-		URL:         req.URL.String(),
-		Cookies:     make([]EditThisCookieFormat, 0),
-		AuthHeaders: make(map[string]string),
-		SessionData: make(map[string]string),
+	setCookies := resp.Cookies()
+	if len(setCookies) == 0 {
+		return
 	}
 
-	// Convert cookies to EditThisCookie format
-	for _, cookie := range cookies {
+	filename := "EditThisCookie_Sessions.json"
+	var exportData []EditThisCookieExport
+
+	// Read existing data if file exists
+	if data, err := os.ReadFile(filename); err == nil {
+		json.Unmarshal(data, &exportData)
+	}
+
+	// Create map for deduplication (key: name+domain)
+	cookieMap := make(map[string]EditThisCookieExport)
+	for _, existing := range exportData {
+		key := existing.Name + "|" + existing.Domain
+		cookieMap[key] = existing
+	}
+
+	// Convert Set-Cookie response cookies to EditThisCookie format
+	for _, cookie := range setCookies {
 		sameSite := "unspecified"
 		switch cookie.SameSite {
 		case http.SameSiteStrictMode:
@@ -1265,67 +1304,73 @@ func exportToEditThisCookie(req *http.Request) {
 			sameSite = "no_restriction"
 		}
 
-		etcCookie := EditThisCookieFormat{
-			Domain:   cookie.Domain,
-			HostOnly: cookie.Domain == "",
-			HttpOnly: cookie.HttpOnly,
-			Name:     cookie.Name,
-			Path:     cookie.Path,
-			SameSite: sameSite,
-			Secure:   cookie.Secure,
-			Session:  cookie.MaxAge == 0 && cookie.Expires.IsZero(),
-			StoreId:  "0",
-			Value:    cookie.Value,
+		// Use cookie.Domain as-is (preserves leading dot)
+		domain := cookie.Domain
+		hostOnly := cookie.Domain == ""
+		
+		if domain == "" {
+			// Extract domain from response/request
+			if resp.Request != nil {
+				domain = resp.Request.URL.Hostname()
+				if domain == "" {
+					domain = resp.Request.Host
+				}
+			}
+			log.Printf("[EXPORT] Response cookie '%s' has no domain, using: %s (hostOnly: true)", cookie.Name, domain)
+		} else {
+			log.Printf("[EXPORT] Response cookie '%s' domain from Set-Cookie: %s (hostOnly: false)", cookie.Name, domain)
 		}
 
+		// Use cookie.Path as-is
+		path := cookie.Path
+		if path == "" {
+			path = "/"
+		}
+
+		etcCookie := EditThisCookieExport{
+			Domain:         domain,
+			ExpirationDate: 0, // Default to 0 for session cookies
+			HostOnly:       hostOnly,
+			HttpOnly:       cookie.HttpOnly,
+			Name:           cookie.Name,
+			Path:           path,
+			SameSite:       sameSite,
+			Secure:         cookie.Secure,
+			Session:        cookie.MaxAge == 0 && cookie.Expires.IsZero(),
+			StoreId:        "0",
+			Value:          cookie.Value,
+		}
+
+		// Set expiration date as float (Unix timestamp with milliseconds)
 		if !cookie.Expires.IsZero() {
-			etcCookie.ExpirationDate = float64(cookie.Expires.Unix())
+			etcCookie.ExpirationDate = float64(cookie.Expires.Unix()) + float64(cookie.Expires.Nanosecond())/1e9
 		}
 
-		exportData.Cookies = append(exportData.Cookies, etcCookie)
+		// Add to map (overwrites if duplicate)
+		key := etcCookie.Name + "|" + etcCookie.Domain
+		cookieMap[key] = etcCookie
 	}
 
-	// Capture auth headers
-	if auth := req.Header.Get("Authorization"); auth != "" {
-		exportData.AuthHeaders["Authorization"] = auth
-	}
-	sessionHeaders := []string{
-		"X-Auth-Token", "X-API-Key", "X-Session-ID", "X-CSRF-Token",
-		"X-Request-ID", "X-Correlation-ID", "X-Access-Token",
-	}
-	for _, header := range sessionHeaders {
-		if value := req.Header.Get(header); value != "" {
-			exportData.AuthHeaders[header] = value
-		}
+	// Convert map back to array
+	exportData = make([]EditThisCookieExport, 0, len(cookieMap))
+	for _, cookie := range cookieMap {
+		exportData = append(exportData, cookie)
 	}
 
-	// Extract OAuth/session data from URL parameters
-	query := req.URL.Query()
-	for key, values := range query {
-		lowerKey := strings.ToLower(key)
-		if strings.Contains(lowerKey, "token") || strings.Contains(lowerKey, "session") ||
-			strings.Contains(lowerKey, "auth") || strings.Contains(lowerKey, "key") {
-			exportData.SessionData[key] = strings.Join(values, ",")
-		}
+	// Write back with error handling
+	jsonData, err := json.MarshalIndent(exportData, "", "    ")
+	if err != nil {
+		log.Printf("[EXPORT] ERROR: Failed to marshal JSON: %v", err)
+		return
 	}
 
-	// Write to EditThisCookie_Sessions.json
-	filename := "EditThisCookie_Sessions.json"
-	var existingData []SessionExport
-
-	// Read existing data if file exists
-	if data, err := os.ReadFile(filename); err == nil {
-		json.Unmarshal(data, &existingData)
+	err = os.WriteFile(filename, jsonData, 0644)
+	if err != nil {
+		log.Printf("[EXPORT] ERROR: Failed to write file %s: %v", filename, err)
+		return
 	}
 
-	// Append new session
-	existingData = append(existingData, exportData)
-
-	// Write back
-	if jsonData, err := json.MarshalIndent(existingData, "", "  "); err == nil {
-		os.WriteFile(filename, jsonData, 0644)
-		log.Printf("[EXPORT] Session exported to %s", filename)
-	}
+	log.Printf("[EXPORT] ✓ %d unique cookies in %s", len(exportData), filename)
 }
 
 func logRequest(req *http.Request, config *ProxyConfig) {
